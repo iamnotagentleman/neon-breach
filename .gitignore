@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+# Raw Meshy downloads (~330 MB); regenerate game assets from them with tools/blender/*.
+concept/raw/
+# Third-party ArtStation references, used only as a private style moodboard — not for distribution.
+concept/references/
+concept/moodboard.jpg

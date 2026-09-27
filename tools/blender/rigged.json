@@ -1,0 +1,71 @@
+{
+  "enemy_runner": {
+    "orig": "concept/raw/enemy_runner.glb",
+    "clips": {
+      "run": "concept/raw/enemy_runner_run.glb",
+      "walk": "concept/raw/enemy_runner_walk.glb"
+    },
+    "emission": {
+      "hues": [
+        25
+      ],
+      "tol": 14,
+      "smin": 0.6,
+      "vmin": 0.85,
+      "strength": 3
+    },
+    "decimate": 9000
+  },
+  "enemy_phantom": {
+    "orig": "concept/raw/enemy_phantom.glb",
+    "clips": {
+      "run": "concept/raw/enemy_phantom_run.glb"
+    },
+    "emission": {
+      "hues": [
+        275,
+        290
+      ],
+      "tol": 20,
+      "smin": 0.5,
+      "vmin": 0.6,
+      "strength": 4
+    },
+    "decimate": 9000
+  },
+  "enemy_brute": {
+    "orig": "concept/raw/enemy_brute.glb",
+    "clips": {
+      "walk": "concept/raw/enemy_brute_walk.glb"
+    },
+    "emission": {
+      "hues": [
+        355
+      ],
+      "tol": 10,
+      "smin": 0.6,
+      "vmin": 0.92,
+      "strength": 3
+    },
+    "autoskin": true,
+    "decimate": 10000
+  },
+  "boss_titan": {
+    "orig": "concept/raw/boss_titan.glb",
+    "clips": {
+      "walk": "concept/raw/boss_titan_walk.glb"
+    },
+    "emission": {
+      "hues": [
+        300,
+        285
+      ],
+      "tol": 22,
+      "smin": 0.45,
+      "vmin": 0.5,
+      "strength": 4
+    },
+    "tex": 1024,
+    "decimate": 16000
+  }
+}

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>NEON//BREACH</title>
+  <meta name="description" content="Cyberpunk tower defense. Defend the data core from rogue drones, cyborgs and corporate warframes.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2305030b'/%3E%3Cpath d='M16 3 L28 10 L28 22 L16 29 L4 22 L4 10 Z' fill='none' stroke='%2300f0ff' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23ff2bd6'/%3E%3C/svg%3E">
+</head>
+<body>
+  <canvas id="bgfx"></canvas>
+
+  <!-- TITLE -->
+  <section id="screen-title" class="screen active">
+    <div class="title-wrap">
+      <div class="kicker">// NIGHT CITY GRID SECURITY PROTOCOL v2.077</div>
+      <h1 class="logo glitch" data-text="NEON//BREACH">NEON//BREACH</h1>
+      <div class="tagline">DEFEND THE DATA CORE. HOLD THE LINE.</div>
+      <nav class="menu">
+        <button class="btn btn-primary" data-action="play"><span>JACK IN</span></button>
+        <button class="btn" data-action="howto"><span>HOW TO PLAY</span></button>
+        <button class="btn" data-action="audio"><span>AUDIO</span></button>
+      </nav>
+      <div class="hint" id="audio-hint">▶ CLICK ANYWHERE TO BOOT AUDIO SUBSYSTEM</div>
+      <div class="loadbar" id="loadbar"><div class="loadbar-fill" id="loadbar-fill"></div><span id="loadbar-text">LOADING 3D ASSETS 0%</span></div>
+    </div>
+    <footer class="credits">SOUNDTRACK &amp; SFX GENERATED WITH <b>ELEVENLABS</b> MUSIC · SOUND EFFECTS</footer>
+  </section>
+
+  <!-- LEVEL SELECT -->
+  <section id="screen-levels" class="screen">
+    <div class="levels-wrap">
+      <h2 class="section-title">SELECT DISTRICT</h2>
+      <div id="level-cards" class="level-cards"></div>
+      <button class="btn btn-small" data-action="back"><span>◀ BACK</span></button>
+    </div>
+  </section>
+
+  <!-- GAME -->
+  <section id="screen-game" class="screen">
+    <header class="hud">
+      <div class="hud-stat" title="Credits">
+        <span class="label">CREDITS</span>
+        <span class="value cr"><span id="hud-credits">0</span>¢</span>
+      </div>
+      <div class="hud-stat" title="Core integrity">
+        <span class="label">CORE</span>
+        <span class="value"><span id="hud-lives">20</span><small>/<span id="hud-maxlives">20</span></small></span>
+        <div class="bar"><div id="hud-lives-bar"></div></div>
+      </div>
+      <div class="hud-stat">
+        <span class="label">WAVE</span>
+        <span class="value"><span id="hud-wave">0</span><small>/<span id="hud-total">20</span></small></span>
+      </div>
+      <div class="hud-stat">
+        <span class="label">HOSTILES</span>
+        <span class="value" id="hud-enemies">0</span>
+      </div>
+      <div class="hud-spacer"></div>
+      <button id="btn-wave" class="btn btn-wave"><span id="btn-wave-label">LAUNCH WAVE 1</span><kbd>SPACE</kbd></button>
+      <div class="speed-group" role="group" aria-label="Game speed">
+        <button class="btn-icon speed active" data-speed="1">1×</button>
+        <button class="btn-icon speed" data-speed="2">2×</button>
+        <button class="btn-icon speed" data-speed="3">3×</button>
+      </div>
+      <button class="btn-icon" id="btn-mute" title="Mute (M)">♪</button>
+      <button class="btn-icon" id="btn-pause" title="Pause (P)">❚❚</button>
+    </header>
+
+    <div class="game-main">
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="game"></canvas>
+        <canvas id="overlay"></canvas>
+        <div class="crt"></div>
+        <div class="cam-hint">RMB DRAG · PAN &nbsp;·&nbsp; WHEEL · ZOOM &nbsp;·&nbsp; MMB · Z X · TURN &nbsp;·&nbsp; C · RESET</div>
+        <div id="banner" class="banner"></div>
+        <div id="toasts" class="toasts"></div>
+      </div>
+
+      <aside class="sidebar">
+        <div class="panel">
+          <div class="panel-title">DEFENSE GRID</div>
+          <div id="shop" class="shop"></div>
+        </div>
+        <div class="panel info-panel" id="info"></div>
+        <div class="panel">
+          <div class="panel-title">NETRUNNER ABILITIES</div>
+          <div id="abilities" class="abilities"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">NEXT WAVE <span id="next-wave-num"></span></div>
+          <div id="next-wave" class="next-wave"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <h2 id="modal-title"></h2>
+      <div id="modal-body"></div>
+      <div id="modal-buttons" class="modal-buttons"></div>
+    </div>
+  </div>
+
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }
+  </script>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

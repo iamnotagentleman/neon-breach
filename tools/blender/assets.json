@@ -1,0 +1,398 @@
+{
+  "tower_laser": {
+    "src": "concept/raw/tower_laser.glb",
+    "size": {
+      "footprint": 0.8
+    },
+    "split": [
+      0.22,
+      0.6
+    ],
+    "auto_yaw": true,
+    "emission": {
+      "hues": [
+        185
+      ],
+      "tol": 25,
+      "smin": 0.4,
+      "vmin": 0.5,
+      "strength": 4
+    },
+    "decimate": 12000
+  },
+  "tower_plasma": {
+    "src": "concept/raw/tower_plasma.glb",
+    "size": {
+      "footprint": 0.82
+    },
+    "split": [
+      0.18,
+      0.5
+    ],
+    "auto_yaw": true,
+    "yaw_after": 180,
+    "emission": {
+      "hues": [
+        300,
+        285
+      ],
+      "tol": 25,
+      "smin": 0.4,
+      "vmin": 0.45,
+      "strength": 4
+    },
+    "decimate": 12000
+  },
+  "tower_tesla": {
+    "src": "concept/raw/tower_tesla.glb",
+    "size": {
+      "footprint": 0.8
+    },
+    "emission": {
+      "hues": [
+        55
+      ],
+      "tol": 14,
+      "smin": 0.55,
+      "vmin": 0.6,
+      "strength": 3.5
+    },
+    "decimate": 12000
+  },
+  "tower_cryo": {
+    "src": "concept/raw/tower_cryo.glb",
+    "size": {
+      "footprint": 0.84
+    },
+    "split": [
+      0.2,
+      0.5
+    ],
+    "emission": {
+      "hues": [
+        195
+      ],
+      "tol": 22,
+      "smin": 0.3,
+      "vmin": 0.5,
+      "strength": 2.5
+    },
+    "decimate": 12000
+  },
+  "tower_rail": {
+    "src": "concept/raw/tower_rail.glb",
+    "size": {
+      "footprint": 0.8
+    },
+    "split": [
+      0.2,
+      0.55
+    ],
+    "auto_yaw": true,
+    "emission": {
+      "hues": [
+        355
+      ],
+      "tol": 16,
+      "smin": 0.5,
+      "vmin": 0.45,
+      "strength": 5
+    },
+    "decimate": 12000
+  },
+  "tower_uplink": {
+    "src": "concept/raw/tower_uplink.glb",
+    "size": {
+      "footprint": 0.78
+    },
+    "split": 0.84,
+    "emission": {
+      "hues": [
+        125
+      ],
+      "tol": 25,
+      "smin": 0.45,
+      "vmin": 0.45,
+      "strength": 3.5
+    },
+    "decimate": 12000
+  },
+  "enemy_drone": {
+    "src": "concept/raw/enemy_drone.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 0.6
+    },
+    "emission": {
+      "hues": [
+        185
+      ],
+      "tol": 25,
+      "smin": 0.4,
+      "vmin": 0.5,
+      "strength": 4
+    },
+    "decimate": 6000
+  },
+  "enemy_aegis": {
+    "src": "concept/raw/enemy_aegis.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 0.62
+    },
+    "yaw": 90,
+    "emission": {
+      "hues": [
+        215,
+        200
+      ],
+      "tol": 20,
+      "smin": 0.45,
+      "vmin": 0.5,
+      "strength": 4
+    },
+    "decimate": 8000
+  },
+  "enemy_splitter": {
+    "src": "concept/raw/enemy_splitter.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 0.7
+    },
+    "emission": {
+      "hues": [
+        115
+      ],
+      "tol": 30,
+      "smin": 0.45,
+      "vmin": 0.45,
+      "strength": 3
+    },
+    "decimate": 8000
+  },
+  "enemy_mite": {
+    "src": "concept/raw/enemy_mite.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 0.36
+    },
+    "emission": {
+      "hues": [
+        120
+      ],
+      "tol": 30,
+      "smin": 0.45,
+      "vmin": 0.45,
+      "strength": 4
+    },
+    "decimate": 3000
+  },
+  "enemy_medic": {
+    "src": "concept/raw/enemy_medic.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 0.6
+    },
+    "emission": {
+      "hues": [
+        125
+      ],
+      "tol": 28,
+      "smin": 0.45,
+      "vmin": 0.45,
+      "strength": 4
+    },
+    "decimate": 8000
+  },
+  "boss_overmind": {
+    "src": "concept/raw/boss_overmind.glb",
+    "pivot": "center",
+    "size": {
+      "maxdim": 1.5
+    },
+    "emission": {
+      "hues": [
+        55,
+        8
+      ],
+      "tol": 18,
+      "smin": 0.55,
+      "vmin": 0.55,
+      "strength": 4
+    },
+    "decimate": 16000
+  },
+  "env_core": {
+    "src": "concept/raw/env_core.glb",
+    "size": {
+      "footprint": 1.25
+    },
+    "emission": {
+      "hues": [
+        185
+      ],
+      "tol": 25,
+      "smin": 0.35,
+      "vmin": 0.45,
+      "strength": 4
+    },
+    "decimate": 14000
+  },
+  "env_portal": {
+    "src": "concept/raw/env_portal.glb",
+    "size": {
+      "height": 1.35
+    },
+    "emission": {
+      "hues": [
+        0,
+        355,
+        15
+      ],
+      "tol": 14,
+      "smin": 0.5,
+      "vmin": 0.5,
+      "strength": 3.5
+    },
+    "decimate": 8000
+  },
+  "env_building": {
+    "src": "concept/raw/env_building.glb",
+    "size": {
+      "footprint": 0.9
+    },
+    "emission": {
+      "hues": [
+        320,
+        185,
+        35,
+        45
+      ],
+      "tol": 22,
+      "smin": 0.3,
+      "vmin": 0.5,
+      "white": 0.82,
+      "strength": 2.2
+    },
+    "decimate": 6000
+  },
+  "tower_laser_t5": {
+    "src": "concept/raw/tower_laser_t5.glb",
+    "size": {
+      "footprint": 0.848
+    },
+    "split": [
+      0.22,
+      0.6
+    ],
+    "auto_yaw": true,
+    "emission": {
+      "hues": [
+        185
+      ],
+      "tol": 25,
+      "smin": 0.4,
+      "vmin": 0.5,
+      "strength": 4
+    },
+    "decimate": 16000
+  },
+  "tower_plasma_t5": {
+    "src": "concept/raw/tower_plasma_t5.glb",
+    "size": {
+      "height": 1.2
+    },
+    "split": [
+      0.3,
+      0.62
+    ],
+    "auto_yaw": true,
+    "emission": {
+      "hues": [
+        300,
+        285
+      ],
+      "tol": 25,
+      "smin": 0.4,
+      "vmin": 0.45,
+      "strength": 4
+    },
+    "decimate": 16000,
+    "yaw_after": -140
+  },
+  "tower_tesla_t5": {
+    "src": "concept/raw/tower_tesla_t5.glb",
+    "size": {
+      "footprint": 0.848
+    },
+    "emission": {
+      "hues": [
+        55
+      ],
+      "tol": 14,
+      "smin": 0.55,
+      "vmin": 0.6,
+      "strength": 3.5
+    },
+    "decimate": 16000
+  },
+  "tower_cryo_t5": {
+    "src": "concept/raw/tower_cryo_t5.glb",
+    "size": {
+      "footprint": 0.89
+    },
+    "split": [
+      0.2,
+      0.5
+    ],
+    "emission": {
+      "hues": [
+        195,
+        205
+      ],
+      "tol": 24,
+      "smin": 0.28,
+      "vmin": 0.5,
+      "strength": 3
+    },
+    "decimate": 16000
+  },
+  "tower_rail_t5": {
+    "src": "concept/raw/tower_rail_t5.glb",
+    "size": {
+      "footprint": 0.848
+    },
+    "split": [
+      0.2,
+      0.55
+    ],
+    "auto_yaw": true,
+    "emission": {
+      "hues": [
+        355
+      ],
+      "tol": 16,
+      "smin": 0.5,
+      "vmin": 0.45,
+      "strength": 5
+    },
+    "decimate": 16000
+  },
+  "tower_uplink_t5": {
+    "src": "concept/raw/tower_uplink_t5.glb",
+    "size": {
+      "footprint": 0.827
+    },
+    "split": 0.86,
+    "emission": {
+      "hues": [
+        125
+      ],
+      "tol": 25,
+      "smin": 0.45,
+      "vmin": 0.45,
+      "strength": 3.5
+    },
+    "decimate": 16000
+  }
+}

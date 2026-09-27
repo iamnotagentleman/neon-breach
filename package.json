@@ -1,0 +1,11 @@
+{
+  "name": "neon-breach",
+  "version": "1.0.0",
+  "description": "Cyberpunk tower defense with an ElevenLabs-generated soundtrack",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs",
+    "sim": "node tools/sim.mjs"
+  }
+}

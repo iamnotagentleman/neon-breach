@@ -1,0 +1,114 @@
+{
+  "tower_laser": {
+    "image": "01a0e424-9634-70cb-8538-ec6ab3423001",
+    "model": "01a0e425-54be-766d-b5a0-c01a9d4f59d2"
+  },
+  "enemy_runner": {
+    "image": "01a0e424-9c86-705b-82b4-9b161e5b7bbd",
+    "model": "01a0e425-5a4b-7495-a566-3475da3e4b5e",
+    "rig": "01a0e42d-21e7-73fb-b35d-03b55a523319"
+  },
+  "tower_plasma": {
+    "image": "01a0e425-6e8d-71d1-99bc-c486e8165fae",
+    "model": "01a0e426-b7bb-7503-a2dc-9dd67dfb2028"
+  },
+  "tower_tesla": {
+    "image": "01a0e425-757c-7786-a678-b9093456db85",
+    "model": "01a0e426-bd23-71d5-bb96-48549c9d3877"
+  },
+  "tower_cryo": {
+    "image": "01a0e425-7cfd-712c-96f5-57c351848218",
+    "model": "01a0e426-c429-7281-92c2-15ae0a20c50b"
+  },
+  "tower_rail": {
+    "image": "01a0e425-8395-76df-b9f8-140d20862773",
+    "model": "01a0e426-cb39-7683-8fe1-ddd8df614546"
+  },
+  "tower_uplink": {
+    "image": "01a0e425-8a38-75a6-b308-bddfb51c97e8",
+    "model": "01a0e426-d2fd-708f-8f96-0a8d69c8810c"
+  },
+  "enemy_drone": {
+    "image": "01a0e425-9162-7093-b498-d22675f5b416",
+    "model": "01a0e426-d92e-73ac-93b2-92580f7659f3"
+  },
+  "enemy_brute": {
+    "image": "01a0e425-9814-774f-9439-8f68d3ddba8c",
+    "model": "01a0e426-ee79-75f5-9076-47e1cb3d58b1",
+    "rig": "01a0e42d-42d5-76e9-bff0-29f7e91c6f25"
+  },
+  "enemy_aegis": {
+    "image": "01a0e425-9ec0-7120-89b3-06ca6631ca3f",
+    "model": "01a0e426-f5cb-7752-a33b-6fef5a632e29"
+  },
+  "enemy_phantom": {
+    "image": "01a0e425-a55e-747b-993c-86e6df76177f",
+    "model": "01a0e429-126e-778e-a530-1fb2d44099e4",
+    "rig": "01a0e42d-3005-7284-a211-efd558d74c4a"
+  },
+  "enemy_splitter": {
+    "image": "01a0e425-ac31-7569-b048-333ef098ffbb",
+    "model": "01a0e429-1767-7472-acd6-211d0babd121"
+  },
+  "enemy_mite": {
+    "image": "01a0e425-b26d-72f5-b9c4-5b42838616d6",
+    "model": "01a0e42c-f3ac-71f6-b9a5-0fa3b1da92fc"
+  },
+  "enemy_medic": {
+    "image": "01a0e425-b920-7001-a857-d78fc47c311d",
+    "model": "01a0e42c-f882-7156-b86a-82ecd9e564f0"
+  },
+  "boss_titan": {
+    "image": "01a0e425-c08d-74d1-9cb2-66ae18549bf5",
+    "model": "01a0e42d-004d-72ef-a33f-2c3c0f0e82da",
+    "rig": "01a0e431-fdf2-722d-9afa-617f068d952b"
+  },
+  "boss_overmind": {
+    "image": "01a0e425-c7bf-7687-a7e2-b6f12af7752c",
+    "model": "01a0e42d-078c-73ea-a6eb-c9ca48a9bc02"
+  },
+  "env_core": {
+    "image": "01a0e425-cede-71d1-8f78-10cb4f2c229e",
+    "model": "01a0e42d-0ec7-7702-aa39-9a5c30174a33"
+  },
+  "env_portal": {
+    "image": "01a0e425-d560-7307-ac69-f1c25eabb14e",
+    "model": "01a0e42d-1683-759d-9c98-01729e2dd174"
+  },
+  "env_building": {
+    "image": "01a0e425-dc1a-72bc-913a-18be5b76d1c7",
+    "model": "01a0e42d-1d97-75a9-a255-57692153c26a"
+  },
+  "t5": {
+    "tower_laser_t5": {
+      "image": "01a0e46a-8dc3-75ea-b47b-1b24ec2b1556",
+      "name": "PHOTON STORM",
+      "model": "01a0e46b-5303-7625-9276-35fb990d8d66"
+    },
+    "tower_plasma_t5": {
+      "image": "01a0e46a-92b0-70b9-8c97-09137c229a7b",
+      "name": "SUNFALL",
+      "model": "01a0e46b-581f-7606-bce6-2ce20397af17"
+    },
+    "tower_tesla_t5": {
+      "image": "01a0e46a-9bb6-7767-98a2-919a95f7c147",
+      "name": "THUNDERHEAD",
+      "model": "01a0e46b-5f29-727e-9d32-801283ca2947"
+    },
+    "tower_cryo_t5": {
+      "image": "01a0e46a-a584-771e-be00-083a586328e2",
+      "name": "GLACIER CORE",
+      "model": "01a0e46b-6596-7600-a731-687b13275f93"
+    },
+    "tower_rail_t5": {
+      "image": "01a0e46a-af10-7529-8756-e2bfaf6b8720",
+      "name": "ANNIHILATOR",
+      "model": "01a0e46b-6c70-77b4-a94f-2d907250c083"
+    },
+    "tower_uplink_t5": {
+      "image": "01a0e46a-b786-7190-883e-f21d56653c93",
+      "name": "BLACKWALL",
+      "model": "01a0e46b-72d6-76d2-885e-2d95119494de"
+    }
+  }
+}
