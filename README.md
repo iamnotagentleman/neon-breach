@@ -50,7 +50,7 @@ Bold paths are each tower's flagship: its tier-5 form is a dedicated Meshy model
 
 **Core integrity**: the core has 100 integrity, and each breach costs what that enemy hits for: Runners 3, Drones 2, Phantoms 4, Patch Drones 5, Heavy Mechs 12, the Titan 35, the Overmind 80. Shields are an extra layer: an Aegis breaching with its shield up costs up to 4 more, the Overmind up to 30 more. A Replicator that breaches also brings its three Nano-Mites. The enemy intel panel shows each enemy's current breach cost.
 
-**Streets**: roads wind through each district with rounded bends that enemies sweep through, with painted lane markings, neon curbs and arrows showing the direction of travel.
+**Streets**: roads wind through each district with rounded bends that enemies sweep through, with painted lane markings and neon curbs.
 
 **Endless mode**: after wave 20, enemy health, group sizes and boss counts keep rising on a logarithmic curve: each wave is harder than the last, by a little less each time.
 

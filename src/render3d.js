@@ -717,7 +717,7 @@ export class Renderer3D {
     g.add(pads);
 
     // Streets: a ribbon following each (corner-rounded) path, textured as wet asphalt with painted lane markings
-    // that pick up a neon tint, neon curbs along both edges, and a few painted arrows showing the direction of travel.
+    // that pick up a neon tint, and neon curbs along both edges.
     const roadTex = canvasTexture(256, 256, (c, w, h) => {
       c.fillStyle = '#17141f'; c.fillRect(0, 0, w, h);
       for (let i = 0; i < 9000; i++) {
@@ -776,14 +776,6 @@ export class Renderer3D {
       return geo;
     };
     const curbMat = new THREE.MeshBasicMaterial({ color: pathCol.clone().multiplyScalar(1.5), toneMapped: false });
-    const arrowTex = canvasTexture(128, 128, (c, w) => {
-      c.fillStyle = '#fff';
-      c.beginPath();
-      c.moveTo(w * 0.86, w * 0.5); c.lineTo(w * 0.5, w * 0.18); c.lineTo(w * 0.5, w * 0.36); c.lineTo(w * 0.14, w * 0.36);
-      c.lineTo(w * 0.14, w * 0.64); c.lineTo(w * 0.5, w * 0.64); c.lineTo(w * 0.5, w * 0.82); c.closePath(); c.fill();
-    }, false);
-    const arrowMat = new THREE.MeshBasicMaterial({ map: arrowTex, color: pathCol.clone().lerp(new THREE.Color(1, 1, 1), 0.4).multiplyScalar(0.9), transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
-    const arrowGeo = new THREE.PlaneGeometry(0.55, 0.55).rotateX(-Math.PI / 2);
     pathsWorld.forEach((pw, pi) => {
       const others = pathsWorld.filter((_, k) => k !== pi);
       const road = new THREE.Mesh(ribbon(pw, 0.5, 0.006 + pi * 0.002, 1), this.roadMat);
@@ -800,21 +792,6 @@ export class Renderer3D {
           if (others.some((o) => distToPath(e, o) < 0.47)) flush(); else run.push(e);
         }
         flush();
-      }
-      // Painted direction arrows every few tiles (not on stretches another path already marks).
-      const p = game.paths[pi];
-      for (let d = 1.6 * TILE; d < p.length - TILE; d += 5 * TILE) {
-        let i = 0;
-        while (i < p.pts.length - 2 && d > p.cum[i + 1]) i++;
-        const a = p.pts[i], b2 = p.pts[i + 1], t = (d - p.cum[i]) / (p.cum[i + 1] - p.cum[i]);
-        const x = wx(a.x + (b2.x - a.x) * t), z = wz(a.y + (b2.y - a.y) * t);
-        if (x < -HW || x > HW || z < -HH || z > HH) continue;
-        if (pi > 0 && distToPath(new THREE.Vector2(x, z), pathsWorld[0]) < 0.3) continue;
-        const arrow = new THREE.Mesh(arrowGeo, arrowMat);
-        arrow.position.set(x, 0.012 + pi * 0.002, z);
-        arrow.rotation.y = -Math.atan2(b2.y - a.y, b2.x - a.x);
-        arrow.renderOrder = 3;
-        g.add(arrow);
       }
     });
 
