@@ -1,5 +1,7 @@
 # NEON//BREACH
 
+**▶ Play in your browser: https://iamnotagentleman.github.io/neon-breach/**
+
 A 3D cyberpunk tower defense game for the browser. Rogue drones, chrome-augmented runners and corporate warframes are pushing toward your data core. Hold three floating districts above a neon megacity for 20 waves each, then see how long you last in Endless mode.
 
 - **3D art**: every tower, enemy, boss and set piece was generated with **Meshy** (AI concept image → image-to-3D, textured PBR), then processed in **Blender**: re-pivoting, turret-head splitting, emissive neon maps, decimation, WebP + Draco compression, rigging and animation.
