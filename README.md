@@ -26,7 +26,7 @@ Any static server works; it just needs HTTP (ES modules, fetched models and audi
 | Click tower | Inspect · `,` `.` `/` upgrade path 1 / 2 / 3 (`U` = its main path) · `S` sell (70% refund) · `T` cycle targeting (first / last / strong / close) |
 | Click enemy | Live intel: hull/shield, armor, speed, bounty, core damage, distance to core, status, counter tip |
 | `Space` | Launch the next wave — calling it while enemies are alive pays an early bonus |
-| `Q` `W` `E` | EMP Burst · Orbital Strike · Overclock |
+| `Q` `W` `E` | EMP Burst · Orbital Strike · Overclock (cooldowns only recharge while a wave is running) |
 | Right-drag / arrow keys | Pan the camera (it stays over the board) · right-click without dragging cancels |
 | Wheel / pinch | Zoom toward the cursor |
 | Middle-drag, `Shift` + right-drag, `Z` / `X` | Turn the camera (`Z` / `X` snap 45°) · `C` resets the view |
@@ -48,7 +48,15 @@ Any static server works; it just needs HTTP (ES modules, fetched models and audi
 
 Bold paths are each tower's flagship: its tier-5 form is a dedicated Meshy model. The other two capstones are path-colored variants of it.
 
-**Hostiles**: Street Runners, Hunter Drones (air), Heavy Mechs (armor), Aegis Units (regenerating shields), Phantoms (flickering optical camo — shown as violet holograms with a ◇ marker while untargetable), Replicators (split into Nano-Mites), Patch Drones (heal allies), and two bosses: the Titan Warframe (waves 10 & 18) and the Overmind (wave 20).
+**Core integrity**: the core has 100 integrity, and each breach costs what that enemy hits for: Runners 3, Drones 2, Phantoms 4, Patch Drones 5, Heavy Mechs 12, the Titan 35, the Overmind 80. Shields are an extra layer: an Aegis breaching with its shield up costs up to 4 more, the Overmind up to 30 more. A Replicator that breaches also brings its three Nano-Mites. The enemy intel panel shows each enemy's current breach cost.
+
+**Streets**: roads wind through each district with rounded bends that enemies sweep through, with painted lane markings, neon curbs and arrows showing the direction of travel.
+
+**Endless mode**: after wave 20, enemy health, group sizes and boss counts keep rising on a logarithmic curve: each wave is harder than the last, by a little less each time.
+
+**Line of sight**: city blocks on each map are placed to break up sight lines. Lasers, tesla arcs (including chain jumps), railgun slugs and cryo pulses can't reach enemies behind a building, and piercing shots stop at walls. Plasma mortars lob over buildings, and the Railgun's Thermal Scope upgrade lets its slugs punch through them. While placing or inspecting a tower, its range area is drawn as the polygon it can actually see: the outline follows the range circle where the view is clear and cuts in along building shadows.
+
+**Hostiles**: Street Runners, Hunter Drones (air), Heavy Mechs (armor), Aegis Units (regenerating shields), Phantoms (permanent optical camo — only camo detection, Uplink fields, EMP or freezes expose them; shown as violet holograms with a ◇ marker), Replicators (split into Nano-Mites), Patch Drones (heal allies), and two bosses: the Titan Warframe (waves 10 & 18) and the Overmind (wave 20).
 
 ## Project layout
 
@@ -70,6 +78,7 @@ assets/audio/              ElevenLabs music and SFX (see PROMPTS.md)
 concept/                   AI concept art, contact sheets, Meshy task manifest
 tools/blender/             asset pipeline scripts (run with Blender in background mode)
 tools/sim.mjs              headless balance simulator
+tools/sightlines.mjs       level-design aid: per-tile visible-road heat map with buildings blocking sight
 vendor/three/              three.js core + the addons the game uses
 ```
 
@@ -95,7 +104,12 @@ CASUAL=1 TOP=0.25 npm run sim -- 5   # decent-but-imperfect placement, 5 runs
 MAP=2 DIFF=1.2 npm run sim           # try a different difficulty multiplier on one map
 ```
 
-The simulated player takes each tower's main path to tier 5 and a second path to tier 2. A coverage-optimal player clears every district flawlessly. A casual player (`CASUAL=1 TOP=0.25`: random spots among the top quarter by coverage) wins roughly a third of runs. Almost every loss is the Overmind breaching on wave 20; waves 1–19 are usually clean.
+The simulated player takes each tower's main path to tier 5 and a second path to tier 2, and scores spots only by the road a tower can actually see. A coverage-optimal player clears every district without a breach. A casual player (`CASUAL=1 TOP=0.25`: random spots among the top quarter by visible coverage) wins about two thirds of runs on Sector 7, about 40% on Neon Docks and about 20% on Core Nexus.
+
+```bash
+node tools/sightlines.mjs 0          # Sector 7: how much road each tile sees with the buildings in place
+BUILDINGS='[[6,4,2],[12,5,2]]' node tools/sightlines.mjs 0   # try a different layout
+```
 
 ## Performance
 

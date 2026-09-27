@@ -7,8 +7,31 @@ import {
 let nextId = 1;
 const noop = () => {};
 
+// Corners are rounded into arcs (radius CORNER_R), so enemies sweep through turns instead of snapping 90°.
+const CORNER_R = 0.72 * TILE;
 export function buildPath(waypoints) {
-  const pts = waypoints.map(([x, y]) => ({ x: (x + 0.5) * TILE, y: (y + 0.5) * TILE }));
+  const raw = waypoints.map(([x, y]) => ({ x: (x + 0.5) * TILE, y: (y + 0.5) * TILE }));
+  const pts = [raw[0]];
+  for (let i = 1; i < raw.length - 1; i++) {
+    const a = raw[i - 1], c = raw[i], b = raw[i + 1];
+    const la = Math.hypot(c.x - a.x, c.y - a.y), lb = Math.hypot(b.x - c.x, b.y - c.y);
+    const ux = (c.x - a.x) / la, uy = (c.y - a.y) / la, vx = (b.x - c.x) / lb, vy = (b.y - c.y) / lb;
+    const turn = Math.acos(Math.max(-1, Math.min(1, ux * vx + uy * vy)));
+    if (turn < 1e-3) { pts.push(c); continue; }
+    // Tangent distance for this radius, kept within half of either leg so back-to-back turns can't overlap.
+    const r = Math.min(CORNER_R, (Math.min(la, lb) * 0.5) / Math.tan(turn / 2));
+    const tdist = r * Math.tan(turn / 2);
+    const p0 = { x: c.x - ux * tdist, y: c.y - uy * tdist };
+    const side = Math.sign(ux * vy - uy * vx); // +1 turning clockwise on screen
+    const cx = p0.x - uy * side * r, cy = p0.y + ux * side * r;
+    const a0 = Math.atan2(p0.y - cy, p0.x - cx);
+    const steps = Math.max(3, Math.round(turn / (Math.PI / 16)));
+    for (let k = 0; k <= steps; k++) {
+      const ang = a0 + side * turn * (k / steps);
+      pts.push({ x: cx + Math.cos(ang) * r, y: cy + Math.sin(ang) * r });
+    }
+  }
+  pts.push(raw[raw.length - 1]);
   const cum = [0];
   for (let i = 1; i < pts.length; i++) {
     cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
@@ -75,9 +98,56 @@ export function buildGrid(map) {
       n++;
     }
   };
-  place(3, 2);
-  place(7, 1);
+  if (map.buildings) {
+    // Hand-placed city blocks: level design uses them to break up sight lines.
+    for (const [x, y, sz] of map.buildings) {
+      let ok = true;
+      for (let oy = 0; oy < sz; oy++) for (let ox = 0; ox < sz; ox++) if (grid[y + oy]?.[x + ox] !== 0) ok = false;
+      if (!ok) continue;
+      for (let oy = 0; oy < sz; oy++) for (let ox = 0; ox < sz; ox++) grid[y + oy][x + ox] = 2;
+      blocked.push([x, y, sz]);
+    }
+  } else {
+    place(3, 2);
+    place(7, 1);
+  }
   return { grid, blocked };
+}
+
+// ---------------------------------------------------------------- line of sight
+// Buildings block direct fire. Footprints are inset a little so shots can graze a corner.
+const LOS_INSET = 0.1 * TILE;
+export function losRects(blocked) {
+  return blocked.map(([x, y, s]) => [x * TILE + LOS_INSET, y * TILE + LOS_INSET, (x + s) * TILE - LOS_INSET, (y + s) * TILE - LOS_INSET]);
+}
+// Fraction (0..1) along the segment where it first enters a building, or Infinity if the line is clear.
+export function segmentBlock(rects, x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0;
+  let best = Infinity;
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i];
+    let t0 = 0, t1 = 1, ok = true;
+    const ps = [-dx, dx, -dy, dy], qs = [x0 - r[0], r[2] - x0, y0 - r[1], r[3] - y0];
+    for (let k = 0; k < 4 && ok; k++) {
+      const p = ps[k], q = qs[k];
+      if (p === 0) { if (q < 0) ok = false; continue; }
+      const t = q / p;
+      if (p < 0) { if (t > t0) t0 = t; } else if (t < t1) t1 = t;
+      if (t0 > t1) ok = false;
+    }
+    if (ok && t0 < best) best = t0;
+  }
+  return best;
+}
+
+// Core damage of a breach: the hull's hit, plus the shield as an extra layer (in proportion to how much of it is
+// still up), plus the children a Replicator would have spawned.
+export function coreDamage(e) {
+  const d = e.def;
+  let dmg = d.lives;
+  if (d.shieldLives && e.maxShield > 0) dmg += Math.ceil(d.shieldLives * (e.shield / e.maxShield));
+  if (d.splits) dmg += d.splits.count * ENEMIES[d.splits.type].lives;
+  return dmg;
 }
 
 export class Enemy {
@@ -239,6 +309,24 @@ export class Tower {
   canUpgrade(p) { return canUpgradePath(this.tiers, p); }
   nextTier(p) { return this.tiers[p] < 5 ? this.def.paths[p].tiers[this.tiers[p]] : null; }
 
+  // Mortar shells arc over buildings, the uplink is a field, and wall-piercing slugs or orbital targeting ignore them.
+  get ignoresWalls() { return this.type === 'plasma' || this.type === 'uplink' || !!this.stats.xray || !!this.stats.global; }
+
+  // Line of sight to an enemy, cached per 8px cell (towers and buildings never move).
+  sees(game, e) {
+    if (this.ignoresWalls) return true;
+    const key = (e.x >> 3) * 1024 + (e.y >> 3);
+    this.sight ||= new Map();
+    let v = this.sight.get(key);
+    if (v === undefined) { v = game.los(this.x, this.y, e.x, e.y); this.sight.set(key, v); }
+    return v;
+  }
+
+  // How far a straight shot travels before hitting a building.
+  reach(game, ux, uy, len) {
+    return this.ignoresWalls ? len : game.rayClear(this.x, this.y, ux, uy, len);
+  }
+
   canHit(e) {
     if (e.dead) return false;
     if (!e.revealed && !this.stats.camo && !this.camoGrant) return false;
@@ -263,7 +351,7 @@ export class Tower {
   acquire(game, n = 1) {
     const r = this.range;
     const pool = [];
-    for (const e of game.enemies) if (this.canHit(e) && this.inRange(e, r)) pool.push(e);
+    for (const e of game.enemies) if (this.canHit(e) && this.inRange(e, r) && this.sees(game, e)) pool.push(e);
     if (pool.length <= n) return pool.sort((a, b) => this.score(b) - this.score(a));
     return pool.sort((a, b) => this.score(b) - this.score(a)).slice(0, n);
   }
@@ -348,7 +436,7 @@ export class Tower {
     if (s.pierce > 1) {
       const a = Math.atan2(target.y - this.y, target.x - this.x);
       const ux = Math.cos(a), uy = Math.sin(a);
-      const hits = this.lineHits(game, this.x, this.y, ux, uy, this.range, 6).filter((e) => this.canHit(e)).slice(0, s.pierce);
+      const hits = this.lineHits(game, this.x, this.y, ux, uy, this.reach(game, ux, uy, this.range), 6).filter((e) => this.canHit(e)).slice(0, s.pierce);
       for (const e of hits) this.hit(game, e, dmg);
       const end = hits[hits.length - 1] || target;
       game.fx.beam(mx, my, end.x, end.y, this.def.color, 3 + this.level, 0.1, { tower: this, target: end, pierce: true });
@@ -382,7 +470,7 @@ export class Tower {
       for (const e of game.enemies) {
         if (hit.has(e) || !this.canHit(e)) continue;
         const d2 = (e.x - cur.x) ** 2 + (e.y - cur.y) ** 2;
-        if (d2 < bd) { bd = d2; next = e; }
+        if (d2 < bd && game.los(cur.x, cur.y, e.x, e.y)) { bd = d2; next = e; }
       }
       if (!next) break;
       mult *= s.falloff;
@@ -401,8 +489,10 @@ export class Tower {
     for (let i = 0; i < n; i++) {
       const a = this.angle + (i - (n - 1) / 2) * 0.1;
       const ux = Math.cos(a), uy = Math.sin(a);
-      for (const e of this.lineHits(game, this.x, this.y, ux, uy, len, 6 * s.beamWidth)) this.hit(game, e, dmg, { pierce: true });
-      const ex = this.x + ux * len, ey = this.y + uy * len;
+      const reach = this.reach(game, ux, uy, len);
+      for (const e of this.lineHits(game, this.x, this.y, ux, uy, reach, 6 * s.beamWidth)) this.hit(game, e, dmg, { pierce: true });
+      const ex = this.x + ux * reach, ey = this.y + uy * reach;
+      if (reach < len) game.fx.sparks(ex, ey, this.def.color, 10, 140); // slug slams into a building
       game.fx.beam(mx, my, ex, ey, this.def.color, (5 + this.level) * s.beamWidth, 0.28, { tower: this, rail: true, width: s.beamWidth });
     }
     game.fx.sparks(mx, my, '#ffffff', 8, 160);
@@ -414,7 +504,7 @@ export class Tower {
     this.angle += 0.013;
     if (this.cd > 0) return;
     const r = this.range;
-    const inside = game.enemies.filter((e) => !e.dead && this.inRange(e, r));
+    const inside = game.enemies.filter((e) => !e.dead && this.inRange(e, r) && this.sees(game, e));
     if (!inside.length) { this.cd = Math.max(this.cd, 0); return; }
     this.cd += 1 / s.rate;
     this.pulses++;
@@ -514,6 +604,7 @@ export class Game {
     const { grid, blocked } = buildGrid(this.map);
     this.grid = grid;
     this.blocked = blocked;
+    this.losRects = losRects(blocked);
     this.credits = this.map.credits;
     this.lives = this.map.lives;
     this.maxLives = this.map.lives;
@@ -543,6 +634,15 @@ export class Game {
   get campaignDone() { return !this.endless && this.wave >= this.totalWaves; }
 
   waveDef(n) { return n <= WAVES.length ? WAVES[n - 1] : endlessWave(n); }
+
+  // True when no building stands between the two points (pixel space).
+  los(x0, y0, x1, y1) { return segmentBlock(this.losRects, x0, y0, x1, y1) === Infinity; }
+
+  // Distance a straight shot from (x0, y0) along unit (ux, uy) travels before a building stops it (max len).
+  rayClear(x0, y0, ux, uy, len) {
+    const t = segmentBlock(this.losRects, x0, y0, x0 + ux * len, y0 + uy * len);
+    return t === Infinity ? len : t * len;
+  }
 
   canPlace(tx, ty, size = 1) {
     for (let y = ty; y < ty + size; y++) {
@@ -714,7 +814,7 @@ export class Game {
     if (e.dead) return;
     e.dead = true;
     e.leaked = true;
-    this.lives = Math.max(0, this.lives - e.def.lives);
+    this.lives = Math.max(0, this.lives - coreDamage(e));
     this.stats.leaked++;
     this.coreHit = 0.6;
     this.shake = Math.max(this.shake, e.def.boss ? 20 : 7);
@@ -776,8 +876,11 @@ export class Game {
     this.time += dt;
     this.shake = Math.max(0, this.shake - dt * 30);
     this.coreHit = Math.max(0, this.coreHit - dt);
-    this.overclockT = Math.max(0, this.overclockT - dt);
-    for (const k in this.cooldowns) this.cooldowns[k] = Math.max(0, this.cooldowns[k] - dt);
+    // Ability timers only run while a wave is live; waiting in the build phase doesn't recharge them.
+    if (this.state === 'playing') {
+      this.overclockT = Math.max(0, this.overclockT - dt);
+      for (const k in this.cooldowns) this.cooldowns[k] = Math.max(0, this.cooldowns[k] - dt);
+    }
 
     // Spawning
     for (const s of this.spawners) {
@@ -822,9 +925,8 @@ export class Game {
         if (s.auraDps && !e.dead) this.damage(e, s.dmg * (1 + t.buffDmg) * s.auraDps * dt, { tower: t, quiet: true });
       }
       if (!e.def.cloaked) continue;
-      // Camo glitches out for ~1s every 3.2s; revealers (Uplinks, Faraday Cage, Cold Snap) and stuns expose it.
-      const flicker = (e.anim % 3.2) > 2.2;
-      e.revealed = flicker || e.stunT > 0 || revealers.some((u) => u.inRange(e, u.range));
+      // Permanent camo: only revealers (Uplinks, Cold Snap) and stuns (EMP, freezes) expose it.
+      e.revealed = e.stunT > 0 || revealers.some((u) => u.inRange(e, u.range));
     }
     // Aura damage can kill; drop the dead before they act.
     for (const t of this.timers) t.t -= dt;

@@ -1,5 +1,5 @@
 import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, TILE, W, H, computeStats } from './config.js';
-import { Game, footprintAnchor } from './game.js';
+import { Game, footprintAnchor, coreDamage } from './game.js';
 import { Renderer } from './render.js';
 import { Renderer3D } from './render3d.js';
 import { AssetLibrary } from './assets3d.js';
@@ -130,7 +130,7 @@ async function startGame(mapIndex) {
       audio.play('wave_clear');
     },
     leak: () => {
-      if (game.lives > 0 && game.lives <= 5) toast('⚠ CORE INTEGRITY CRITICAL', '#ff3355');
+      if (game.lives > 0 && game.lives <= game.maxLives * 0.25) toast('⚠ CORE INTEGRITY CRITICAL', '#ff3355');
     },
     end: (won) => setTimeout(() => { if (game === g) endScreen(won); }, won ? 900 : 1400),
   });
@@ -159,7 +159,7 @@ function recordProgress(won) {
   rec.best = Math.max(rec.best || 0, Math.min(game.wave, game.totalWaves));
   if (game.endless) rec.endless = Math.max(rec.endless || 0, game.wave);
   if (won) {
-    const stars = game.lives >= 18 ? 3 : game.lives >= 10 ? 2 : 1;
+    const stars = game.lives >= game.maxLives * 0.9 ? 3 : game.lives >= game.maxLives * 0.5 ? 2 : 1;
     rec.stars = Math.max(rec.stars || 0, stars);
   }
   persist();
@@ -169,7 +169,7 @@ function endScreen(won) {
   if (screen !== 'game' || !game) return;
   recordProgress(won);
   audio.play(won ? 'victory' : 'game_over');
-  const stars = game.lives >= 18 ? 3 : game.lives >= 10 ? 2 : 1;
+  const stars = game.lives >= game.maxLives * 0.9 ? 3 : game.lives >= game.maxLives * 0.5 ? 2 : 1;
   const starHtml = won ? `<div class="end-stars stars">${[0, 1, 2].map((k) => `<span class="${k < stars ? '' : 'off'}">★</span>`).join('')}</div>` : '';
   const endlessNote = game.endless ? `<p>Endless run ended at wave <b>${game.wave}</b>.</p>` : '';
   const body = `
@@ -331,7 +331,7 @@ const TRAITS = [
   ['STUN', (s) => s.stunChance > 0], ['MARK', (s) => s.markAmp > 0], ['CLUSTER', (s) => s.cluster > 0], ['FIRE', (s) => s.fireZone > 0],
   ['KNOCKBACK', (s) => s.knockback > 0], ['FREEZE', (s) => s.freezeChance > 0 || s.freezeEvery > 0], ['BRITTLE', (s) => s.brittle > 0],
   ['SHARDS', (s) => s.shards > 0], ['SHATTER', (s) => s.shatter > 0], ['BLIZZARD', (s) => s.globalSlow > 0], ['BOSS ×', (s) => s.bossMul > 1],
-  ['GLOBAL', (s) => s.global], ['BURST', (s) => s.burstEvery > 0], ['NO FALLOFF', (s) => s.falloff >= 1 && s.chains > 0],
+  ['GLOBAL', (s) => s.global], ['THROUGH WALLS', (s) => s.xray], ['BURST', (s) => s.burstEvery > 0], ['NO FALLOFF', (s) => s.falloff >= 1 && s.chains > 0],
   ['ARMOR ↓', (s) => s.auraArmorDown > 0], ['DMG AMP', (s) => s.auraAmp > 0], ['LEECH', (s) => s.auraShieldDrain > 0],
   ['SLOW FIELD', (s) => s.auraSlow > 0], ['BOUNTY', (s) => s.bounty > 0 || s.killBounty > 0], ['AIR', (s) => s.air],
 ];
@@ -362,7 +362,7 @@ const COUNTERS = {
   drone: 'Airborne: Lasers, Tesla, Cryo and Railguns hit it. Plasma Mortars cannot.',
   brute: 'Armor blunts weak hits. Railguns ignore armor; heavy Plasma shells punch through.',
   aegis: 'Shield regenerates after 2s without damage. Tesla deals 3× to shields; EMP strips them.',
-  phantom: 'Only targetable in a Netrunner Uplink field or while its camo glitches. Cryo and splash still hit it.',
+  phantom: 'Always cloaked: needs camo detection (Laser Hack, Rail Thermal Scope, Hive Mind) or a Netrunner Uplink field. EMP and freezes expose it; cryo and splash still hit it.',
   splitter: 'Bursts into 3 Nano-Mites — keep splash or chain damage behind it.',
   mite: 'Fast and fragile — Tesla chains and Cryo pulses sweep them up.',
   medic: 'Heals everything around it. Kill it first: STRONG/CLOSE targeting or a Railgun line.',
@@ -395,7 +395,7 @@ function enemyPanelHtml(e) {
     <dl class="stat-grid">
       <dt>SPEED</dt><dd id="ei-speed"></dd>
       <dt>BOUNTY</dt><dd>${e.reward}¢</dd>
-      <dt>CORE DMG</dt><dd>${d.lives}</dd>
+      <dt>CORE DMG</dt><dd id="ei-core"></dd>
       <dt>TO CORE</dt><dd id="ei-dist"></dd>
       <dt>STATUS</dt><dd id="ei-status"></dd>
     </dl>
@@ -421,6 +421,11 @@ function updateEnemyPanel(e) {
   const speed = e.stunT > 0 ? 0 : e.def.speed * (1 - slow);
   panel.querySelector('#ei-speed').textContent = `${speed.toFixed(2)} tiles/s${slow ? ` (−${Math.round(slow * 100)}%)` : ''}`;
   panel.querySelector('#ei-dist').textContent = `${Math.max(0, e.remaining / TILE).toFixed(1)} tiles`;
+  // Live breach cost: hull + whatever shield layer is still up (+ unspawned Nano-Mites).
+  const extra = [];
+  if (e.def.shieldLives && e.shield > 0) extra.push('shield');
+  if (e.def.splits) extra.push(`${e.def.splits.count} mites`);
+  panel.querySelector('#ei-core').textContent = `${coreDamage(e)}${extra.length ? ` (incl. ${extra.join(' + ')})` : ''}`;
   const st = [];
   if (e.stunT > 0) st.push('<span style="color:var(--cyan)">STUNNED</span>');
   if (e.slowT > 0) st.push('<span style="color:#5aa0ff">SLOWED</span>');
@@ -503,6 +508,7 @@ function renderInfo(force) {
       panel.innerHTML = `<div class="panel-title">SYSTEM</div><div class="info-empty">
         Select a defense (<b>1–6</b>) and click an empty tile to deploy.<br>
         Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget.<br>
+        Buildings block line of sight — a tower's range area only covers what it can see.<br>
         <b>SPACE</b> launches waves — calling early pays a bonus.<br>
         <b>Q W E</b> abilities · <b>F</b> speed · <b>P</b> pause · <b>RMB/ESC</b> cancel.<br>
         Camera: <b>RMB drag</b>/<b>arrows</b> pan · <b>wheel</b> zoom · <b>MMB</b>/<b>Z X</b> turn · <b>C</b> reset.</div>`;
@@ -785,7 +791,9 @@ function showHowTo() {
       <li>Click a tower to inspect · <b>,</b> <b>.</b> <b>/</b> buy the next tier on paths 1–3 · <b>S</b> sell (70% refund) · <b>T</b> target mode</li>
       <li>Every tower has <b>3 upgrade paths × 5 tiers</b>. Crosspathing: you can invest in two paths, and only one may go past tier 2 (e.g. 5-2-0)</li>
       <li><b>Space</b> launch next wave — calling it early pays bonus credits</li>
-      <li><b>Q</b> EMP Burst · <b>W</b> Orbital Strike · <b>E</b> Overclock</li>
+      <li><b>Buildings block line of sight</b>: lasers, tesla arcs, railgun slugs and cryo pulses can't reach what's behind them. While placing or inspecting a tower, its range area only covers the ground it can see. Plasma mortars lob over buildings; the Railgun's Thermal Scope punches through them</li>
+      <li><b>Phantoms are always cloaked</b>: you need camo detection or a Netrunner Uplink field to hit them</li>
+      <li><b>Q</b> EMP Burst · <b>W</b> Orbital Strike · <b>E</b> Overclock — cooldowns only recharge while a wave is running</li>
       <li><b>F</b> cycle speed · <b>P</b>/<b>Esc</b> pause · <b>M</b> mute · Right-click cancels</li>
       <li><b>Right-drag</b> or <b>arrow keys</b> pan the camera · <b>Mouse wheel</b> zooms toward the cursor · <b>Middle-drag</b> (or <b>Shift</b> + right-drag) or <b>Z</b> / <b>X</b> turn it · <b>C</b> resets the view</li>
     </ul>

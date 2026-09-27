@@ -20,7 +20,7 @@ export const STAT_DEFAULTS = {
   auraDps: 0, auraSlow: 0, auraShieldDrain: 0, reveal: false,
   slow: 0, slowDur: 1.4, bossSlow: false, freezeChance: 0, freezeDur: 0.8, freezeEvery: 0,
   brittle: 0, shards: 0, shatter: 0, globalSlow: 0,
-  slugs: 1, beamWidth: 1, global: false,
+  slugs: 1, beamWidth: 1, global: false, xray: false,
   buffDmg: 0, buffRate: 0, grantCamo: false, income: 0, killBounty: 0, auraArmorDown: 0, auraAmp: 0,
 };
 
@@ -58,7 +58,7 @@ export const TOWERS = {
   },
   plasma: {
     name: 'PLASMA MORTAR', color: '#ff2bd6', cost: 170, air: false, ground: true, size: 2,
-    desc: 'Lobs plasma shells that splash on impact. Cannot hit airborne drones.',
+    desc: 'Lobs plasma shells over buildings that splash on impact. Cannot hit airborne drones.',
     base: { dmg: 36, rate: 0.8, range: 3.8, splash: 1.2 },
     paths: [
       path('PAYLOAD', '#ff2bd6', [
@@ -161,7 +161,7 @@ export const TOWERS = {
       ]),
       path('TARGETING', '#00f0ff', [
         tier('Long Barrel', 160, '+1 range.', 'range+1'),
-        tier('Thermal Scope', 250, 'Can target cloaked Phantoms.', 'camo'),
+        tier('Thermal Scope', 250, 'Sees cloaked Phantoms and through buildings; slugs punch through walls.', 'camo', 'xray'),
         tier('Marked Target', 605, 'Hit enemies take +25% damage for 3s.', 'markAmp=0.25'),
         tier('Kill Protocol', 1300, '+50% damage; marks amplify 40%.', 'dmg*1.5', 'markAmp=0.4'),
         tier('ORBITAL LINK', 3850, 'Satellite targeting: unlimited range.', 'global', 'dmg*1.8'),
@@ -234,27 +234,27 @@ export function canUpgradePath(tiers, p) {
 
 export const ENEMIES = {
   runner: {
-    name: 'STREET RUNNER', hp: 55, speed: 1.35, reward: 7, lives: 1, radius: 0.33, color: '#ff8a00',
+    name: 'STREET RUNNER', hp: 55, speed: 1.35, reward: 7, lives: 3, radius: 0.33, color: '#ff8a00',
     desc: 'Chrome-augmented street punk. Standard threat.',
   },
   drone: {
-    name: 'HUNTER DRONE', hp: 28, speed: 1.9, reward: 5, lives: 1, radius: 0.32, color: '#00f0ff', flying: true,
+    name: 'HUNTER DRONE', hp: 28, speed: 1.9, reward: 5, lives: 2, radius: 0.32, color: '#00f0ff', flying: true,
     desc: 'Fast and airborne. Plasma Mortars cannot hit it.',
   },
   brute: {
-    name: 'HEAVY MECH', hp: 240, speed: 0.75, reward: 18, lives: 2, radius: 0.5, armor: 6, color: '#ff3355',
+    name: 'HEAVY MECH', hp: 240, speed: 0.75, reward: 18, lives: 12, radius: 0.5, armor: 6, color: '#ff3355',
     desc: 'Armored walker. Armor blunts every hit — Railguns ignore it.',
   },
   aegis: {
-    name: 'AEGIS UNIT', hp: 90, shield: 130, speed: 1.05, reward: 15, lives: 1, radius: 0.42, color: '#3d8bff',
+    name: 'AEGIS UNIT', hp: 90, shield: 130, speed: 1.05, reward: 15, lives: 4, shieldLives: 4, radius: 0.42, color: '#3d8bff',
     desc: 'Regenerating energy shield. Tesla Coils and EMP shred shields.',
   },
   phantom: {
-    name: 'PHANTOM', hp: 75, speed: 1.6, reward: 13, lives: 1, radius: 0.33, color: '#a855ff', cloaked: true,
-    desc: 'Optical camo flickers — only briefly targetable, unless inside a Netrunner Uplink field. Splash & slow still hit it.',
+    name: 'PHANTOM', hp: 75, speed: 1.6, reward: 13, lives: 4, radius: 0.33, color: '#a855ff', cloaked: true,
+    desc: 'Permanent optical camo: invisible to towers without camo detection unless inside a Netrunner Uplink field or stunned. Splash & slow still hit it.',
   },
   splitter: {
-    name: 'REPLICATOR', hp: 140, speed: 1.0, reward: 10, lives: 1, radius: 0.44, color: '#39ff14',
+    name: 'REPLICATOR', hp: 140, speed: 1.0, reward: 10, lives: 4, radius: 0.44, color: '#39ff14',
     splits: { type: 'mite', count: 3 },
     desc: 'Self-replicating nanoswarm. Bursts into three Nano-Mites when destroyed.',
   },
@@ -263,22 +263,26 @@ export const ENEMIES = {
     desc: 'Tiny self-replicated crawler released when a Replicator is destroyed.',
   },
   medic: {
-    name: 'PATCH DRONE', hp: 110, speed: 1.1, reward: 16, lives: 1, radius: 0.38, color: '#e8f6ff',
+    name: 'PATCH DRONE', hp: 110, speed: 1.1, reward: 16, lives: 5, radius: 0.38, color: '#e8f6ff',
     heal: { rate: 14, radius: 1.6 },
     desc: 'Field repair unit. Continuously heals nearby enemies — kill it first.',
   },
   titan: {
-    name: 'TITAN WARFRAME', hp: 2300, speed: 0.5, reward: 250, lives: 6, radius: 0.85, armor: 10, color: '#ff2bd6', boss: true,
-    desc: 'Corporate siege frame. Massive armor plating. Costs 6 integrity if it breaches.',
+    name: 'TITAN WARFRAME', hp: 2300, speed: 0.5, reward: 250, lives: 35, radius: 0.85, armor: 10, color: '#ff2bd6', boss: true,
+    desc: 'Corporate siege frame. Massive armor plating. A breach costs 35 core integrity.',
   },
   overmind: {
-    name: 'OVERMIND', hp: 5200, shield: 1400, speed: 0.42, reward: 600, lives: 15, radius: 1.0, armor: 12, color: '#ffe600', boss: true,
+    name: 'OVERMIND', hp: 5200, shield: 1400, speed: 0.42, reward: 600, lives: 80, shieldLives: 30, radius: 1.0, armor: 12, color: '#ffe600', boss: true,
     spawns: { type: 'drone', every: 3.5, count: 3 },
     desc: 'Rogue AI core. Shielded, armored, and launches drone swarms. Stop it at all costs.',
   },
 };
 
-export const hpMultiplier = (wave) => 1 + 0.16 * (wave - 1) + 0.017 * (wave - 1) ** 2;
+// Campaign (waves 1-20): a quadratic ramp. Endless (21+): logarithmic growth from the wave-20 level, so each wave
+// is harder than the last but by less and less (starts at the campaign's ~8%/wave and tapers off).
+const campaignHp = (wave) => 1 + 0.16 * (wave - 1) + 0.017 * (wave - 1) ** 2;
+export const endlessLog = (wave) => Math.log(1 + Math.max(0, wave - 20) / 10);
+export const hpMultiplier = (wave) => campaignHp(Math.min(wave, 20)) * (1 + 0.8 * endlessLog(wave));
 export const waveBonus = (wave) => 30 + 8 * wave;
 export const earlyBonus = (wave) => 10 + 3 * wave;
 export const SELL_RATIO = 0.7;
@@ -302,32 +306,42 @@ export const ABILITIES = {
 // Waypoints are tile coordinates; the first sits just off-map, the last is the data core.
 export const MAPS = [
   {
-    id: 'sector7', name: 'SECTOR 7', subtitle: 'Downtown Grid', diff: 1.0, credits: 420, lives: 20,
+    id: 'sector7', name: 'SECTOR 7', subtitle: 'Downtown Grid', diff: 0.72, credits: 420, lives: 100,
     theme: { path: '#ff2bd6', accent: '#00f0ff', ground: '#070512' },
     difficulty: 'STANDARD',
     paths: [
       [[-1, 2], [4, 2], [4, 10], [10, 10], [10, 3], [16, 3], [16, 11], [20, 11], [20, 6], [22, 6]],
     ],
+    // City blocks [x, y, size] break up sight lines: walls down both U-turn pockets and a split in the
+    // right-hand pocket, so no single spot sees three stretches of road (tools/sightlines.mjs).
+    buildings: [[6, 4, 2], [6, 7, 2], [12, 4, 2], [12, 8, 2], [17, 8, 1], [19, 8, 1], [18, 10, 1], [5, 11, 1], [9, 11, 1], [2, 5, 1],
+      [20, 0, 2], [22, 1, 1], [22, 9, 1]],
     seed: 7,
   },
   {
-    id: 'docks', name: 'NEON DOCKS', subtitle: 'Harbor Freight Zone', diff: 0.97, credits: 480, lives: 20,
+    id: 'docks', name: 'NEON DOCKS', subtitle: 'Harbor Freight Zone', diff: 0.74, credits: 480, lives: 100,
     theme: { path: '#00f0ff', accent: '#ff8a00', ground: '#040912' },
     difficulty: 'HARD',
     paths: [
       [[-1, 2], [7, 2], [7, 6], [13, 6], [13, 2], [18, 2], [18, 10], [22, 10]],
       [[-1, 11], [7, 11], [7, 6], [13, 6], [13, 2], [18, 2], [18, 10], [22, 10]],
     ],
+    // A wall between the two entry lanes, blocks in both loop pockets and at the exit bend.
+    buildings: [[15, 3, 2], [14, 5, 1], [17, 5, 1], [11, 4, 2], [9, 5, 1], [2, 6, 2], [4, 6, 2], [19, 8, 1], [21, 8, 1], [19, 6, 1],
+      [13, 0, 1], [22, 13, 1], [0, 12, 1]],
     seed: 21,
   },
   {
-    id: 'nexus', name: 'CORE NEXUS', subtitle: 'Arcology Mainframe', diff: 0.8, credits: 560, lives: 20,
+    id: 'nexus', name: 'CORE NEXUS', subtitle: 'Arcology Mainframe', diff: 0.56, credits: 560, lives: 100,
     theme: { path: '#ffe600', accent: '#a855ff', ground: '#0a0510' },
     difficulty: 'EXTREME',
     paths: [
       [[2, -1], [2, 5], [8, 5], [8, 2], [14, 2], [14, 7], [21, 7]],
       [[2, 14], [2, 9], [8, 9], [8, 12], [14, 12], [14, 7], [21, 7]],
     ],
+    // An arcology wall down the spine between the lanes, towers on both merge corners and in the loop pockets.
+    buildings: [[15, 5, 2], [15, 8, 2], [3, 7, 1], [4, 7, 1], [5, 7, 1], [6, 7, 1], [7, 7, 1], [10, 3, 2], [10, 9, 2], [12, 5, 1], [12, 8, 1],
+      [20, 0, 1], [20, 13, 1]],
     seed: 99,
   },
 ];
@@ -368,9 +382,10 @@ export function endlessWave(n) {
   for (let i = 0; i < k; i++) {
     const type = ENDLESS_POOL[Math.floor(rnd() * ENDLESS_POOL.length)];
     const base = { runner: 18, drone: 20, brute: 7, aegis: 10, phantom: 10, splitter: 8, medic: 4 }[type];
-    const count = Math.round(base * (1 + (n - 20) * 0.06));
-    groups.push(g(type, count, Math.max(0.2, 1.2 - n * 0.02), i * 3));
+    // Group sizes, spawn density and boss counts grow on the same logarithmic curve as enemy health.
+    const grow = 1 + 0.9 * endlessLog(n);
+    groups.push(g(type, Math.round(base * grow), Math.max(0.2, 0.8 / grow), i * 3));
   }
-  if (n % 5 === 0) groups.push(g(n % 10 === 0 ? 'overmind' : 'titan', 1 + Math.floor((n - 20) / 15), 6, 5));
+  if (n % 5 === 0) groups.push(g(n % 10 === 0 ? 'overmind' : 'titan', 1 + Math.floor(Math.log2(1 + (n - 20) / 10)), 6, 5));
   return groups;
 }

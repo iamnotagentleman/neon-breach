@@ -49,7 +49,9 @@ function bestTile(game, type, pts) {
     if (type === 'uplink') {
       for (const t of game.towers) if (t.type !== 'uplink' && (t.x - x) ** 2 + (t.y - y) ** 2 <= (r + 1) ** 2) s += 1 + t.level;
     } else {
-      for (const p of pts) if ((p.x - x) ** 2 + (p.y - y) ** 2 <= r * r) s += p.w;
+      // Only road the tower can actually see counts (mortars lob over buildings).
+      const walls = type !== 'plasma';
+      for (const p of pts) if ((p.x - x) ** 2 + (p.y - y) ** 2 <= r * r && (!walls || game.los(x, y, p.x, p.y))) s += p.w;
     }
     if (CASUAL && s > 0) cands.push({ s, tile: [tx, ty] });
     if (s > bs) { bs = s; best = [tx, ty]; }

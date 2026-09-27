@@ -16,12 +16,13 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { TILE, COLS, ROWS, TOWERS, ABILITIES } from './config.js';
 import { ENEMY_VIS } from './assets3d.js';
-import { seededRandom, footprintAnchor } from './game.js';
+import { seededRandom, footprintAnchor, segmentBlock } from './game.js';
 
 const HW = COLS / 2, HH = ROWS / 2;
 const wx = (px) => px / TILE - HW;
 const wz = (py) => py / TILE - HH;
 const PAD_Y = 0.1;
+const SIGHT_Y = 0.13;
 // Model scale per footprint: 2x2 heavies read as big installations, not scaled-up 1x1 towers.
 const towerScale = (size, level = 0) => (size > 1 ? 1.95 : 1.15) + level * 0.035 * size;
 // Add-on kit per tower per upgrade path (tiers 1-4; tier 5 swaps the model).
@@ -369,17 +370,11 @@ export class Renderer3D {
     this.tileMarker.renderOrder = 5;
     this.scene.add(this.tileMarker);
 
-    const dashTex = canvasTexture(512, 16, (g, w, h) => {
-      for (let x = 0; x < w; x += 32) { g.fillStyle = '#fff'; g.fillRect(x, 0, 20, h); }
-    }, false);
-    dashTex.wrapS = THREE.RepeatWrapping;
+    // Range outline: a plain, static ring.
     this.rangeRing = new THREE.Group();
-    const ringMat = new THREE.MeshBasicMaterial({ color: '#ffffff', map: dashTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide });
-    const ringGeo = new THREE.RingGeometry(0.975, 1, 128, 1);
+    const ringMat = new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide });
+    const ringGeo = new THREE.RingGeometry(0.985, 1, 128, 1);
     ringGeo.rotateX(-Math.PI / 2);
-    // Map the dash texture around the ring's circumference.
-    const uv = ringGeo.attributes.uv, pos = ringGeo.attributes.position;
-    for (let i = 0; i < uv.count; i++) uv.setXY(i, (Math.atan2(pos.getZ(i), pos.getX(i)) / TAU + 0.5) * 24, uv.getY(i));
     this.rangeRingLine = new THREE.Mesh(ringGeo, ringMat);
     const disk = new THREE.Mesh(new THREE.CircleGeometry(1, 96).rotateX(-Math.PI / 2),
       new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.07, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false }));
@@ -413,6 +408,14 @@ export class Renderer3D {
     this.reticle = this.rangeRing.clone(true);
     this.reticle.children.forEach((c) => { c.material = c.material.clone(); });
     this.scene.add(this.reticle);
+    // Tower sight: the area a tower can actually see, as a polygon (light fill + outline). Rays from the tower stop
+    // at buildings, so the outline follows the range arc where the view is clear and cuts in along shadow edges.
+    this.sightFill = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.08, depthWrite: false, toneMapped: false, side: THREE.DoubleSide }));
+    this.sightLineMat = new LineMaterial({ color: 0xffffff, linewidth: 2, transparent: true, depthWrite: false, toneMapped: false });
+    this.sightLine = new Line2(new LineGeometry(), this.sightLineMat);
+    for (const o of [this.sightFill, this.sightLine]) { o.frustumCulled = false; o.renderOrder = 6; o.visible = false; this.scene.add(o); }
+    this.sightKey = '';
+    this.sightRects = [];
 
     // Shared geometries/materials for pooled effects.
     this.beamGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
@@ -506,6 +509,7 @@ export class Renderer3D {
     this.composer.setPixelRatio(dpr);
     this.bloom.resolution.set(size.x, size.y);
     for (const m of this.lineMats.values()) m.resolution.set(w, h);
+    this.sightLineMat?.resolution.set(w, h);
     this.fitCamera();
   }
 
@@ -638,6 +642,7 @@ export class Renderer3D {
   setGame(game) {
     this.game = game;
     this.clearDynamic();
+    this.setSightBlockers(game.blocked);
     const g = this.boardGroup;
     while (g.children.length) g.remove(g.children[0]);
     const theme = game.map.theme;
@@ -711,53 +716,107 @@ export class Renderer3D {
     pads.receiveShadow = true;
     g.add(pads);
 
-    // Road ribbons with flowing chevrons.
-    this.roadMat = new THREE.ShaderMaterial({
-      uniforms: { time: { value: 0 }, color: { value: pathCol.clone() } },
-      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
-      fragmentShader: `
-        varying vec2 vUv; uniform float time; uniform vec3 color;
-        void main(){
-          float u = vUv.x; float v = vUv.y - 0.5;
-          float chev = fract(u * 1.25 - time * 0.6 - abs(v) * 0.9);
-          float c = smoothstep(0.0, 0.05, chev) * (1.0 - smoothstep(0.12, 0.22, chev)) * step(abs(v), 0.18);
-          float lane = (1.0 - smoothstep(0.0, 0.02, abs(abs(v) - 0.42))) * 0.25;
-          vec3 base = vec3(0.028, 0.022, 0.05) + vec3(0.02) * step(0.5, fract(u * 3.0 + v * 7.0)) * 0.3;
-          gl_FragColor = vec4(base + color * (c * 1.25 + lane), 1.0);
-        }`,
-    });
-    game.paths.forEach((p, pi) => {
-      const geos = [];
-      for (let i = 0; i < p.pts.length - 1; i++) {
-        const a = p.pts[i], b = p.pts[i + 1];
-        const ax = wx(a.x), az = wz(a.y), bx = wx(b.x), bz = wz(b.y);
-        const len = Math.hypot(bx - ax, bz - az);
-        const geo = new THREE.PlaneGeometry(len + 1, 1);
-        const uv = geo.attributes.uv;
-        const u0 = p.cum[i] / TILE - 0.5, u1 = p.cum[i + 1] / TILE + 0.5;
-        for (let k = 0; k < uv.count; k++) uv.setX(k, uv.getX(k) ? u1 : u0);
-        geo.rotateX(-Math.PI / 2);
-        geo.rotateY(-Math.atan2(bz - az, bx - ax));
-        geo.translate((ax + bx) / 2, 0.006 + i * 0.0004 + pi * 0.002, (az + bz) / 2);
-        geos.push(geo);
+    // Streets: a ribbon following each (corner-rounded) path, textured as wet asphalt with painted lane markings
+    // that pick up a neon tint, neon curbs along both edges, and a few painted arrows showing the direction of travel.
+    const roadTex = canvasTexture(256, 256, (c, w, h) => {
+      c.fillStyle = '#17141f'; c.fillRect(0, 0, w, h);
+      for (let i = 0; i < 9000; i++) {
+        const l = rnd();
+        c.fillStyle = l < 0.5 ? `rgba(0,0,0,${0.12 + rnd() * 0.2})` : `rgba(190,180,220,${0.03 + rnd() * 0.05})`;
+        c.fillRect(rnd() * w, rnd() * h, 1 + rnd() * 2, 1 + rnd() * 2);
       }
-      const road = new THREE.Mesh(mergeGeometries(geos), this.roadMat);
+      for (let i = 0; i < 5; i++) { // patched asphalt
+        c.fillStyle = `rgba(0,0,0,${0.12 + rnd() * 0.12})`;
+        c.beginPath(); c.ellipse(rnd() * w, h * (0.2 + rnd() * 0.6), 12 + rnd() * 30, 6 + rnd() * 14, rnd() * 3, 0, TAU); c.fill();
+      }
+    });
+    roadTex.wrapS = THREE.RepeatWrapping;
+    const markTex = canvasTexture(256, 256, (c, w, h) => {
+      c.fillStyle = '#000'; c.fillRect(0, 0, w, h);
+      c.fillStyle = '#fff';
+      c.fillRect(w * 0.08, h * 0.49, w * 0.5, h * 0.02); // centre dash
+    }, false);
+    markTex.wrapS = THREE.RepeatWrapping;
+    this.roadMat = new THREE.MeshStandardMaterial({
+      map: roadTex, emissiveMap: markTex, emissive: pathCol.clone().lerp(new THREE.Color(1, 1, 1), 0.35), emissiveIntensity: 0.9,
+      roughness: 0.42, metalness: 0.25, envMapIntensity: 0.9,
+    });
+    const pathsWorld = game.paths.map((p) => p.pts.map((q) => new THREE.Vector2(wx(q.x), wz(q.y))));
+    const distToPath = (v, pw) => {
+      let best = Infinity;
+      for (let i = 0; i < pw.length - 1; i++) {
+        const a = pw[i], d = tmpV2.set(pw[i + 1].x - a.x, 0, pw[i + 1].y - a.y);
+        const L2 = d.x * d.x + d.z * d.z;
+        const t = Math.max(0, Math.min(1, ((v.x - a.x) * d.x + (v.y - a.y) * d.z) / L2));
+        best = Math.min(best, Math.hypot(a.x + d.x * t - v.x, a.y + d.z * t - v.y));
+      }
+      return best;
+    };
+    const ribbon = (pw, half, y, uScale) => {
+      const n = pw.length;
+      const pos = [], uv = [], idx = [];
+      let u = -0.5;
+      for (let i = 0; i < n; i++) {
+        const prev = pw[Math.max(0, i - 1)], next = pw[Math.min(n - 1, i + 1)];
+        const tx = next.x - prev.x, tz = next.y - prev.y, tl = Math.hypot(tx, tz) || 1;
+        const nx = -tz / tl, nz = tx / tl;
+        // Stretch the ends half a tile so the road runs into the portal and under the core.
+        const ext = i === 0 ? -0.5 : i === n - 1 ? 0.5 : 0;
+        const cx = pw[i].x + (tx / tl) * ext, cz = pw[i].y + (tz / tl) * ext;
+        if (i > 0) u += Math.hypot(pw[i].x - pw[i - 1].x, pw[i].y - pw[i - 1].y) + (i === n - 1 ? 0.5 : 0);
+        pos.push(cx + nx * half, y, cz + nz * half, cx - nx * half, y, cz - nz * half);
+        uv.push(u * uScale, 1, u * uScale, 0);
+        if (i < n - 1) { const k = i * 2; idx.push(k, k + 2, k + 1, k + 1, k + 2, k + 3); }
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+      geo.setIndex(idx);
+      geo.computeVertexNormals();
+      return geo;
+    };
+    const curbMat = new THREE.MeshBasicMaterial({ color: pathCol.clone().multiplyScalar(1.5), toneMapped: false });
+    const arrowTex = canvasTexture(128, 128, (c, w) => {
+      c.fillStyle = '#fff';
+      c.beginPath();
+      c.moveTo(w * 0.86, w * 0.5); c.lineTo(w * 0.5, w * 0.18); c.lineTo(w * 0.5, w * 0.36); c.lineTo(w * 0.14, w * 0.36);
+      c.lineTo(w * 0.14, w * 0.64); c.lineTo(w * 0.5, w * 0.64); c.lineTo(w * 0.5, w * 0.82); c.closePath(); c.fill();
+    }, false);
+    const arrowMat = new THREE.MeshBasicMaterial({ map: arrowTex, color: pathCol.clone().lerp(new THREE.Color(1, 1, 1), 0.4).multiplyScalar(0.9), transparent: true, opacity: 0.5, depthWrite: false, toneMapped: false });
+    const arrowGeo = new THREE.PlaneGeometry(0.55, 0.55).rotateX(-Math.PI / 2);
+    pathsWorld.forEach((pw, pi) => {
+      const others = pathsWorld.filter((_, k) => k !== pi);
+      const road = new THREE.Mesh(ribbon(pw, 0.5, 0.006 + pi * 0.002, 1), this.roadMat);
       road.receiveShadow = true;
       g.add(road);
+      // Curbs: thin strips along both edges, skipped where they'd cut across another path's road (merges).
+      for (const side of [1, -1]) {
+        let run = [];
+        const flush = () => { if (run.length > 1) g.add(new THREE.Mesh(ribbon(run, 0.02, 0.03, 1), curbMat)); run = []; };
+        for (let i = 0; i < pw.length; i++) {
+          const prev = pw[Math.max(0, i - 1)], next = pw[Math.min(pw.length - 1, i + 1)];
+          const tx = next.x - prev.x, tz = next.y - prev.y, tl = Math.hypot(tx, tz) || 1;
+          const e = new THREE.Vector2(pw[i].x - (tz / tl) * 0.49 * side, pw[i].y + (tx / tl) * 0.49 * side);
+          if (others.some((o) => distToPath(e, o) < 0.47)) flush(); else run.push(e);
+        }
+        flush();
+      }
+      // Painted direction arrows every few tiles (not on stretches another path already marks).
+      const p = game.paths[pi];
+      for (let d = 1.6 * TILE; d < p.length - TILE; d += 5 * TILE) {
+        let i = 0;
+        while (i < p.pts.length - 2 && d > p.cum[i + 1]) i++;
+        const a = p.pts[i], b2 = p.pts[i + 1], t = (d - p.cum[i]) / (p.cum[i + 1] - p.cum[i]);
+        const x = wx(a.x + (b2.x - a.x) * t), z = wz(a.y + (b2.y - a.y) * t);
+        if (x < -HW || x > HW || z < -HH || z > HH) continue;
+        if (pi > 0 && distToPath(new THREE.Vector2(x, z), pathsWorld[0]) < 0.3) continue;
+        const arrow = new THREE.Mesh(arrowGeo, arrowMat);
+        arrow.position.set(x, 0.012 + pi * 0.002, z);
+        arrow.rotation.y = -Math.atan2(b2.y - a.y, b2.x - a.x);
+        arrow.renderOrder = 3;
+        g.add(arrow);
+      }
     });
-    // Neon road edges.
-    const isPath = (x, y) => x >= 0 && y >= 0 && x < COLS && y < ROWS && game.grid[y][x] === 1;
-    const edgeGeos = [];
-    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
-      if (!isPath(x, y)) continue;
-      const cx = x - HW, cz = y - HH;
-      const add = (w, d, px, pz) => { const e = new THREE.BoxGeometry(w, 0.05, d); e.translate(px, 0.035, pz); edgeGeos.push(e); };
-      if (y > 0 && !isPath(x, y - 1)) add(1, 0.035, cx + 0.5, cz + 0.02);
-      if (y < ROWS - 1 && !isPath(x, y + 1)) add(1, 0.035, cx + 0.5, cz + 0.98);
-      if (x > 0 && !isPath(x - 1, y)) add(0.035, 1, cx + 0.02, cz + 0.5);
-      if (x < COLS - 1 && !isPath(x + 1, y)) add(0.035, 1, cx + 0.98, cz + 0.5);
-    }
-    if (edgeGeos.length) g.add(new THREE.Mesh(mergeGeometries(edgeGeos), new THREE.MeshBasicMaterial({ color: pathCol.clone().multiplyScalar(1.7), toneMapped: false })));
 
     // Buildings on blocked tiles.
     const bTpl = this.assets.get('env_building');
@@ -1689,7 +1748,6 @@ export class Renderer3D {
     this.adaptResolution(realDt);
     const t = this.time;
     this.gridMat.uniforms.time.value = t;
-    if (this.roadMat) this.roadMat.uniforms.time.value = t;
 
     this.processEvents(game);
     this.syncTowers(game, simDt, ui);
@@ -1754,6 +1812,66 @@ export class Renderer3D {
     this.drawOverlay(game, ui, realDt);
   }
 
+  // Buildings as world-space rectangles, inset like the game's line-of-sight test.
+  setSightBlockers(blocked) {
+    const inset = 0.1;
+    this.sightRects = blocked.map(([x, y, s]) => [x - HW + inset, y - HH + inset, x + s - HW - inset, y + s - HH - inset]);
+    this.sightKey = '';
+  }
+
+  // Visibility polygon around (x, z): rays every degree plus a pair grazing each building corner (crisp shadow
+  // edges), each cut short by the first building it meets. Returns [x, z] points in angle order.
+  sightPolygon(x, z, r, walls) {
+    const rects = walls ? this.sightRects.filter(([ax, az, bx, bz]) => {
+      const dx = Math.max(ax - x, 0, x - bx), dz = Math.max(az - z, 0, z - bz);
+      return dx * dx + dz * dz < r * r;
+    }) : [];
+    const angles = [];
+    for (let i = 0; i < 360; i++) angles.push((i / 360) * TAU);
+    for (const [ax, az, bx, bz] of rects) {
+      for (const [cx, cz] of [[ax, az], [bx, az], [ax, bz], [bx, bz]]) {
+        const a = Math.atan2(cz - z, cx - x);
+        angles.push(a - 1e-4, a + 1e-4);
+      }
+    }
+    const norm = angles.map((a) => ((a % TAU) + TAU) % TAU).sort((p, q) => p - q);
+    return norm.map((a) => {
+      const ux = Math.cos(a), uz = Math.sin(a);
+      const t = rects.length ? segmentBlock(rects, x, z, x + ux * r, z + uz * r) : Infinity;
+      const d = t === Infinity ? r : t * r;
+      return [x + ux * d, z + uz * d];
+    });
+  }
+
+  // Show the sight polygon for a tower at (x, z) with range r (world units); rebuilt only when something changed.
+  showSight(x, z, r, color, walls, bright = 1) {
+    const key = `${x.toFixed(2)}|${z.toFixed(2)}|${r.toFixed(2)}|${walls}`;
+    if (key !== this.sightKey) {
+      this.sightKey = key;
+      const poly = this.sightPolygon(x, z, r, walls);
+      const n = poly.length;
+      const pos = new Float32Array(n * 9);
+      for (let i = 0; i < n; i++) {
+        const p = poly[i], q = poly[(i + 1) % n];
+        pos.set([x, SIGHT_Y, z, p[0], SIGHT_Y, p[1], q[0], SIGHT_Y, q[1]], i * 9);
+      }
+      const fill = new THREE.BufferGeometry();
+      fill.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      this.sightFill.geometry.dispose();
+      this.sightFill.geometry = fill;
+      const flat = [];
+      for (const p of poly) flat.push(p[0], SIGHT_Y + 0.004, p[1]);
+      flat.push(poly[0][0], SIGHT_Y + 0.004, poly[0][1]);
+      const line = new LineGeometry();
+      line.setPositions(flat);
+      this.sightLine.geometry.dispose();
+      this.sightLine.geometry = line;
+    }
+    this.sightFill.material.color.copy(col(color)).multiplyScalar(1.3);
+    this.sightLineMat.color.copy(col(color)).multiplyScalar(2 * bright);
+    this.sightFill.visible = this.sightLine.visible = true;
+  }
+
   updateCursor(game, ui) {
     const se = ui.selectedEnemy;
     const sv = se && this.enemyViews.get(se.id);
@@ -1766,17 +1884,11 @@ export class Renderer3D {
     const h = ui.hover;
     this.tileMarker.visible = false;
     this.rangeRing.visible = false;
+    this.sightFill.visible = this.sightLine.visible = false;
     this.reticle.visible = false;
     if (this.ghosts) for (const g of Object.values(this.ghosts)) g.visible = false;
     const sel = ui.selected;
-    if (sel) {
-      this.rangeRing.visible = true;
-      this.rangeRing.position.set(wx(sel.x), 0.13, wz(sel.y));
-      this.rangeRing.scale.setScalar(sel.range / TILE);
-      this.rangeRingLine.material.color.copy(col(sel.def.color)).multiplyScalar(2);
-      this.rangeDisk.material.color.copy(col(sel.def.color));
-      this.rangeRingLine.rotation.y = this.time * 0.2;
-    }
+    if (sel) this.showSight(wx(sel.x), wz(sel.y), sel.range / TILE, sel.def.color, !sel.ignoresWalls);
     if (!h) return;
     if (ui.ability) {
       const ab = ABILITIES[ui.ability];
@@ -1785,7 +1897,6 @@ export class Renderer3D {
       this.reticle.scale.setScalar(ab.radius);
       this.reticle.children[0].material.color.copy(col(ab.color)).multiplyScalar(2.5);
       this.reticle.children[1].material.color.copy(col(ab.color));
-      this.reticle.children[0].rotation.y = -this.time;
       return;
     }
     const inside = h.tx >= 0 && h.ty >= 0 && h.tx < COLS && h.ty < ROWS;
@@ -1803,13 +1914,7 @@ export class Renderer3D {
       this.tileMarker.position.set(fx, 0.115, fz);
       this.tileMarker.scale.setScalar(size);
       this.tileMarker.material.color.set(ok ? '#39ff14' : '#ff3355').multiplyScalar(2);
-      if (!sel) {
-        this.rangeRing.visible = true;
-        this.rangeRing.position.set(fx, 0.13, fz);
-        this.rangeRing.scale.setScalar(def.base.range);
-        this.rangeRingLine.material.color.copy(col(def.color)).multiplyScalar(ok ? 2 : 0.6);
-        this.rangeDisk.material.color.copy(col(def.color));
-      }
+      if (!sel) this.showSight(fx, fz, def.base.range, def.color, ui.placing !== 'plasma' && ui.placing !== 'uplink', ok ? 1 : 0.3);
       const gh = this.ghost(ui.placing);
       gh.visible = fits;
       gh.position.set(fx, PAD_Y, fz);
