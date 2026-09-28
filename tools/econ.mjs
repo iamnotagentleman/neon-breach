@@ -2,6 +2,7 @@
 //   node tools/econ.mjs              upgrade value table for every tower
 //   node tools/econ.mjs rail         one tower
 //   node tools/econ.mjs flow [runs]  credits earned / spent / banked per wave in simulated runs (CASUAL=1 TOP=0.25 works)
+//   node tools/econ.mjs raw [type]   raw damage per credit of every tier-4 / tier-5 build against enemies that can't die
 //
 // A tier is judged in the part of the campaign where it's usually bought (tier 1 around wave 4 ... tier 5 around
 // wave 18): one tower on Sector 7, at the spot that sees the most road, faces a stream of real (killable) enemies
@@ -187,6 +188,47 @@ async function flow(runs) {
   }
 }
 
+// Raw throughput: the value table above counts only hull a tower strips, so once it kills everything a stronger tier
+// looks worthless (overkill). Here one build, at its best Sector 7 spot, faces a dense stream of wave-16 enemies that
+// can't die, for 40 s: damage per credit invested shows which capstones outclass the rest.
+function raw(only) {
+  const mix = ['runner', 'brute', 'aegis', 'drone', 'runner', 'splitter', 'phantom', 'medic', 'runner', 'drone'];
+  const lab = (type, tiers) => {
+    const game = new Game(0, {});
+    game.credits = 1e9;
+    game.lives = game.maxLives = 1e9;
+    const heat = coverageMap(game, type);
+    let bi = 0;
+    for (let i = 0; i < heat.length; i++) if (heat[i] > heat[bi]) bi = i;
+    const t = game.build(type, bi % COLS, Math.floor(bi / COLS));
+    tiers.forEach((n, p) => { for (let k = 0; k < n; k++) game.upgrade(t, p); });
+    game.state = 'playing';
+    game.wave = 16;
+    let next = 0, i = 0;
+    for (let time = 0; time < 40; time += DT) {
+      if (time >= next) {
+        const e = game.spawnEnemy(mix[i % mix.length], i % game.paths.length, 16, 0, null, mix[i % mix.length] === 'drone' && game.airPaths.length > 0);
+        e.hp = e.maxHp = 1e7;
+        e.cloaked = false; e.revealed = true; // camo is a separate question
+        i++;
+        next += 0.35;
+      }
+      game.update(DT);
+      t.xp = 0; t.rank = 0; // no veterancy in the lab
+    }
+    return t.dmgDealt / t.invested;
+  };
+  for (const type of only ? [only] : TOWER_ORDER.filter((k) => k !== 'uplink')) {
+    const def = TOWERS[type];
+    console.log(def.name);
+    def.paths.forEach((p, i) => {
+      const tiers = (lvl) => [0, 1, 2].map((k) => (k === i ? lvl : k === (i ? 0 : 1) ? 2 : 0));
+      console.log(`  ${p.name.padEnd(12)} T4 ${lab(type, tiers(4)).toFixed(1).padStart(5)}   T5 ${p.tiers[4].name.padEnd(16)} ${lab(type, tiers(5)).toFixed(1).padStart(5)} dmg/¢`);
+    });
+  }
+}
+
 const arg = process.argv[2];
 if (arg === 'flow') await flow(Number(process.argv[3] || 4));
+else if (arg === 'raw') raw(process.argv[3]);
 else for (const type of arg ? [arg] : TOWER_ORDER) table(type);

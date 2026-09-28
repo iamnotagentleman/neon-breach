@@ -287,6 +287,10 @@ kbd {
 .path .btn.up { padding: 5px 8px; font-size: 11px; letter-spacing: 0.04em; border-color: var(--pc); color: var(--pc); background: transparent; text-shadow: none; display: flex; gap: 6px; align-items: center; clip-path: none; }
 .path .btn.up:hover:not(:disabled) { background: var(--pc); color: #000; }
 .actions.one { grid-template-columns: 1fr; }
+.actions.aimable { grid-template-columns: 1fr 1fr; }
+.actions.aimable .sell { grid-column: 1 / -1; }
+.actions .aim.on { background: var(--c, var(--cyan)); color: #000; }
+.aim-hint { font-size: 10px; line-height: 1.45; color: var(--dim); margin-top: 6px; border-left: 2px solid var(--c, var(--cyan)); padding-left: 6px; }
 .path-preview { font-family: var(--font-display); font-size: 10px; letter-spacing: 0.1em; margin-top: 6px; }
 .enemy-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 .enemy-head img { width: 64px; height: 64px; object-fit: contain; flex-shrink: 0; filter: drop-shadow(0 0 8px color-mix(in srgb, var(--c) 50%, transparent)); }

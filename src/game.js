@@ -39,6 +39,37 @@ export function buildPath(waypoints) {
   return { pts, cum, length: cum[cum.length - 1], waypoints };
 }
 
+// Sky lane for a road: flyers leave the same gate and follow the road, but cut straight across each corner (up to
+// AIR_CUT tiles back along both legs, at most half of either) wherever that chord keeps AIR_CLEAR tiles from the tall
+// blocks, which stand above their flight level. `tall` = [x, y, size] footprints. Returns tile waypoints.
+const AIR_CUT = 2.5, AIR_CLEAR = 0.45;
+export function skyLane(waypoints, tall) {
+  const P = waypoints.map(([x, y]) => [x + 0.5, y + 0.5]); // tile centres
+  const clear = ([ax, ay], [bx, by]) => {
+    const n = Math.ceil(Math.hypot(bx - ax, by - ay) / 0.1);
+    for (let s = 0; s <= n; s++) {
+      const x = ax + ((bx - ax) * s) / n, y = ay + ((by - ay) * s) / n;
+      for (const [rx, ry, rs] of tall) {
+        if (Math.hypot(Math.max(rx - x, 0, x - rx - rs), Math.max(ry - y, 0, y - ry - rs)) < AIR_CLEAR) return false;
+      }
+    }
+    return true;
+  };
+  const out = [P[0]];
+  for (let i = 1; i < P.length - 1; i++) {
+    const [ax, ay] = P[i - 1], [cx, cy] = P[i], [bx, by] = P[i + 1];
+    const la = Math.hypot(cx - ax, cy - ay), lb = Math.hypot(bx - cx, by - cy);
+    const u = [(cx - ax) / la, (cy - ay) / la], v = [(bx - cx) / lb, (by - cy) / lb];
+    // Out of the gate along the road first (it starts a tile off the board), and into the core along it.
+    let k = Math.min(AIR_CUT, i === 1 ? la - 1.5 : la / 2, i === P.length - 2 ? lb - 0.5 : lb / 2);
+    const cut = (d) => [[cx - u[0] * d, cy - u[1] * d], [cx + v[0] * d, cy + v[1] * d]];
+    while (k > 0.2 && !clear(...cut(k))) k -= 0.25;
+    if (k > 0.2) out.push(...cut(k)); else out.push(P[i]);
+  }
+  out.push(P[P.length - 1]);
+  return out.map(([x, y]) => [x - 0.5, y - 0.5]);
+}
+
 // Tiles covered by axis-aligned segments between waypoints, clipped to the grid.
 export function pathTiles(waypoints) {
   const out = [];
@@ -150,27 +181,41 @@ export function segmentBlock(rects, x0, y0, x1, y1) {
   return best;
 }
 
+// Points every `step` px along some built paths, clipped to the board.
+function routeSamples(paths, step) {
+  const out = [];
+  for (const p of paths) {
+    for (let d = 0; d < p.length; d += step) {
+      const q = pathPoint(p, d);
+      if (q.x >= 0 && q.y >= 0 && q.x <= COLS * TILE && q.y <= ROWS * TILE) out.push(q);
+    }
+  }
+  return out;
+}
+
+// Sky lane tiles count for much less than road in the heat map: only the drones fly them, a small share of any wave.
+export const AIR_HEAT_WEIGHT = 0.25;
+
 // Placement heat map: for every tile, how many tiles of road a `type` tower anchored there would cover (only road it
 // can see, unless it fires over buildings), or -1 where it can't be built. Uplinks score the towers they'd buff.
+// Towers that hit flyers also score the sky lanes they'd see (over the low-rise blocks), at AIR_HEAT_WEIGHT;
+// the parts are kept on the result as `.road` and `.air` (tiles in view).
 export function coverageMap(game, type) {
   const def = TOWERS[type], size = def.size || 1;
   const r = def.base.range * TILE;
   const walls = type !== 'plasma' && type !== 'uplink';
   const STEP = 8;
-  if (!game.roadSamples) {
-    game.roadSamples = [];
-    for (const p of game.paths) {
-      for (let d = 0; d < p.length; d += STEP) {
-        const q = pathPoint(p, d);
-        if (q.x >= 0 && q.y >= 0 && q.x <= COLS * TILE && q.y <= ROWS * TILE) game.roadSamples.push(q);
-      }
-    }
-  }
+  game.roadSamples ||= routeSamples(game.paths, STEP);
+  game.airSamples ||= routeSamples(game.airPaths, STEP);
+  const air = def.air ? game.airSamples : [];
   const out = new Float32Array(COLS * ROWS).fill(-1);
+  out.road = new Float32Array(COLS * ROWS);
+  out.air = new Float32Array(COLS * ROWS);
   for (let ty = 0; ty < ROWS; ty++) {
     for (let tx = 0; tx < COLS; tx++) {
       if (!game.canPlace(tx, ty, size)) continue;
       const x = (tx + size / 2) * TILE, y = (ty + size / 2) * TILE;
+      const i = ty * COLS + tx;
       let v = 0;
       if (type === 'uplink') {
         for (const t of game.towers) {
@@ -180,8 +225,12 @@ export function coverageMap(game, type) {
         for (const q of game.roadSamples) {
           if ((q.x - x) ** 2 + (q.y - y) ** 2 <= r * r && (!walls || game.los(x, y, q.x, q.y))) v += STEP / TILE;
         }
+        for (const q of air) {
+          if ((q.x - x) ** 2 + (q.y - y) ** 2 <= r * r && (!walls || game.los(x, y, q.x, q.y, true))) out.air[i] += STEP / TILE;
+        }
       }
-      out[ty * COLS + tx] = v;
+      out.road[i] = v;
+      out[i] = v + out.air[i] * AIR_HEAT_WEIGHT;
     }
   }
   return out;
@@ -199,7 +248,8 @@ export function coreDamage(e) {
 }
 
 export class Enemy {
-  constructor(game, type, pathIdx, waveId, startDist = 0, mods = null) {
+  // `air`: `pathIdx` is one of the map's sky lanes instead of a road.
+  constructor(game, type, pathIdx, waveId, startDist = 0, mods = null, air = false) {
     const def = ENEMIES[type];
     const mul = hpMultiplier(waveId) * game.map.diff;
     this.id = nextId++;
@@ -227,7 +277,8 @@ export class Enemy {
     this.reward = Math.round(def.reward * 1.3 * (1 + 0.04 * (waveId - 1)) * (1 + 0.2 * this.mods.length));
     this.healRate = def.heal ? def.heal.rate * mul : 0;
     this.pathIdx = pathIdx;
-    this.path = game.paths[pathIdx];
+    this.air = air;
+    this.path = (air ? game.airPaths : game.paths)[pathIdx];
     this.dist = startDist;
     this.seg = 0;
     this.offset = def.boss ? 0 : (Math.random() - 0.5) * 0.26 * TILE;
@@ -361,7 +412,6 @@ export class Tower {
     this.x = (tx + this.size / 2) * TILE;
     this.y = (ty + this.size / 2) * TILE;
     this.tiers = [0, 0, 0];
-    this.cd = 0.2;
     this.angle = -Math.PI / 2;
     this.mode = 'first';
     this.invested = this.def.cost;
@@ -380,7 +430,11 @@ export class Tower {
     this.jamKind = null;
     this.buffSrc = null; // the Uplink whose buff this tower is getting
     this.fresh = false; // bought during the current build phase: sells for a full refund
+    this.aim = null; // manual aim point (Mortar: ground spot, Railgun: firing line through it), used in 'aim' mode
+    this.engaged = false; // has something to shoot at (so it's loading / firing)
+    this.charge = 0; // load progress 0..1 while engaged, for the renderer
     this.refresh();
+    this.cd = this.stats.rate ? 1 / this.stats.rate : 0; // built unloaded
   }
 
   refresh() { this.stats = computeStats(this.def, this.tiers, this.rank); }
@@ -398,19 +452,41 @@ export class Tower {
   // Mortar shells arc over buildings, the uplink is a field, and wall-piercing slugs or orbital targeting ignore them.
   get ignoresWalls() { return this.type === 'plasma' || this.type === 'uplink' || !!this.stats.xray || !!this.stats.global; }
 
-  // Line of sight to an enemy, cached per 8px cell (towers and buildings never move).
+  // Line of sight to an enemy, cached per 8px cell (towers and buildings never move). Flyers cruise above the
+  // low-rise blocks, so only the tall ones hide them.
   sees(game, e) {
     if (this.ignoresWalls) return true;
-    const key = (e.x >> 3) * 1024 + (e.y >> 3);
+    const key = ((e.x >> 3) * 1024 + (e.y >> 3)) * 2 + (e.flying ? 1 : 0);
     this.sight ||= new Map();
     let v = this.sight.get(key);
-    if (v === undefined) { v = game.los(this.x, this.y, e.x, e.y); this.sight.set(key, v); }
+    if (v === undefined) { v = game.los(this.x, this.y, e.x, e.y, e.flying); this.sight.set(key, v); }
     return v;
   }
 
-  // How far a straight shot travels before hitting a building.
-  reach(game, ux, uy, len) {
-    return this.ignoresWalls ? len : game.rayClear(this.x, this.y, ux, uy, len);
+  // How far a straight shot travels before hitting a building (`air`: only a tall one, for shots at flyers).
+  reach(game, ux, uy, len, air = false) {
+    return this.ignoresWalls ? len : game.rayClear(this.x, this.y, ux, uy, len, air);
+  }
+
+  // Manual aim ('aim' mode, Mortar and Railgun only): the player picks a ground spot or a firing line.
+  get aimable() { return this.type === 'plasma' || this.type === 'rail'; }
+  get aiming() { return this.mode === 'aim' && !!this.aim; }
+
+  // The aim point a click at (x, y) gives: pulled inside the Mortar's range; null if it's on top of the tower.
+  aimAt(x, y) {
+    let dx = x - this.x, dy = y - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d < TILE * 0.5) return null;
+    if (this.type === 'plasma' && d > this.range) { dx *= this.range / d; dy *= this.range / d; }
+    return { x: this.x + dx, y: this.y + dy };
+  }
+
+  setAim(x, y) {
+    const p = this.aimAt(x, y);
+    if (!p) return false;
+    this.aim = p;
+    this.mode = 'aim';
+    return true;
   }
 
   canHit(e) {
@@ -464,41 +540,101 @@ export class Tower {
     if (s.markAmp) { e.markAmp = Math.max(e.markT > 0 ? e.markAmp : 0, s.markAmp); e.markT = s.markDur; }
   }
 
-  // Enemies within `width` of the segment from (x0,y0) in direction (ux,uy), sorted by distance along it.
-  lineHits(game, x0, y0, ux, uy, len, width) {
+  // Enemies within `width` of the segment from (x0,y0) in direction (ux,uy), sorted by distance along it. Ground
+  // enemies only count up to `groundLen` (where a low building stops the shot); flyers above it up to `len`.
+  lineHits(game, x0, y0, ux, uy, len, width, groundLen = len) {
     const out = [];
     for (const e of game.enemies) {
       if (e.dead) continue;
       const px = e.x - x0, py = e.y - y0;
       const along = px * ux + py * uy;
-      if (along < 0 || along > len) continue;
+      if (along < 0 || along > (e.flying ? len : groundLen)) continue;
       if (Math.abs(px * uy - py * ux) < e.radius + width) out.push([along, e]);
     }
     return out.sort((a, b) => a[0] - b[0]).map((p) => p[1]);
   }
 
+  // Where an enemy will be `t` seconds from now if it keeps its current pace (for the Mortar's spot trigger).
+  predict(e, t) {
+    if (e.stunT > 0) return e;
+    const slow = Math.max(e.slowT > 0 ? e.slowAmt : 0, e.auraSlow);
+    const d = e.dist + e.dir * e.speed * (1 - Math.min(0.85, slow)) * TILE * t;
+    return pathPoint(e.path, Math.max(0, Math.min(e.path.length, d)), e.seg);
+  }
+
+  // Aim mode: fire only when a shot at the spot / down the line would actually hit something the tower can target.
+  aimReady(game) {
+    const { x: ax, y: ay } = this.aim;
+    if (this.type === 'plasma') {
+      const dur = this.shellTime(ax, ay);
+      // Wait until the shell would land near the middle of the blast, not glance its edge at half damage.
+      const r = this.stats.splash * TILE * 0.65;
+      return game.enemies.some((e) => {
+        if (!this.canHit(e)) return false;
+        const q = this.predict(e, dur);
+        return (q.x - ax) ** 2 + (q.y - ay) ** 2 <= (r + e.radius * 0.5) ** 2;
+      });
+    }
+    const { ux, uy, reach, reachAir } = this.railLine(game, Math.atan2(ay - this.y, ax - this.x));
+    return this.lineHits(game, this.x, this.y, ux, uy, reachAir, 6 * this.stats.beamWidth, reach).some((e) => this.canHit(e));
+  }
+
   update(dt, game) {
     this.built = Math.min(1, this.built + dt * 3);
     this.fireFlash = Math.max(0, this.fireFlash - dt);
+    this.engaged = false;
+    this.charge = 0;
     if (this.jamT > 0) return; // offline: no fire, no pulses, no fields
     const s = this.stats;
     if (this.type === 'uplink') { this.angle += dt * 1.4; return; }
     const rateMul = (1 + this.buffRate) * (game.overclockT > 0 ? ABILITIES.overclock.mult : 1);
-    this.cd -= dt * rateMul;
+    // Weapons only load while there's something to shoot at: an idle tower doesn't sit on a ready shot, so every
+    // engagement opens with the load (whatever is left of it from the last one). True once loaded.
+    const load = () => {
+      this.engaged = true;
+      this.cd -= dt * rateMul;
+      this.charge = Math.min(1, Math.max(0, 1 - this.cd * s.rate));
+      return this.cd <= 0;
+    };
     const dmg = (s.dmg || 0) * (1 + this.buffDmg);
 
-    if (this.type === 'cryo') { this.pulse(game, dmg); return; }
+    if (this.type === 'cryo') { this.pulse(game, dmg, load); return; }
+
+    if (this.aiming) {
+      // Manual aim: load while anything it can hit is in range, then hold the shot until something is about to be
+      // in the spot / on the line.
+      this.angle = Math.atan2(this.aim.y - this.y, this.aim.x - this.x);
+      if (!game.enemies.some((e) => this.canHit(e) && this.inRange(e, this.range))) return;
+      if (!load()) return;
+      if (!this.aimReady(game)) { this.cd = 0; return; }
+      this.cd += 1 / s.rate;
+      this.fireFlash = 0.12;
+      this.shots++;
+      const [mx, my] = this.muzzle();
+      if (this.type === 'plasma') {
+        // Extra shells of a volley land around the spot rather than stacking on it.
+        for (let i = 0; i < s.targets; i++) {
+          const a = Math.random() * Math.PI * 2, d = i ? Math.sqrt(Math.random()) * s.splash * TILE * 0.45 : 0;
+          this.lobShell(game, this.aim.x + Math.cos(a) * d, this.aim.y + Math.sin(a) * d, dmg, mx, my);
+        }
+        game.fx.emit({ type: 'fire', tower: this });
+        game.hooks.sfx('plasma', this);
+      } else {
+        this.fireRail(game, dmg, mx, my);
+        game.hooks.sfx('rail', this);
+      }
+      return;
+    }
 
     const targets = this.acquire(game, s.targets);
-    if (!targets.length) { this.cd = Math.max(this.cd, 0); return; }
+    if (!targets.length) return;
     const target = targets[0];
     this.angle = Math.atan2(target.y - this.y, target.x - this.x);
-    if (this.cd > 0) return;
+    if (!load()) return;
     this.cd += 1 / s.rate;
     this.fireFlash = 0.12;
     this.shots++;
-    const mx = this.x + Math.cos(this.angle) * TILE * 0.38 * this.size;
-    const my = this.y + Math.sin(this.angle) * TILE * 0.38 * this.size;
+    const [mx, my] = this.muzzle();
 
     switch (this.type) {
       case 'laser':
@@ -523,12 +659,17 @@ export class Tower {
     }
   }
 
+  muzzle() {
+    return [this.x + Math.cos(this.angle) * TILE * 0.38 * this.size, this.y + Math.sin(this.angle) * TILE * 0.38 * this.size];
+  }
+
   fireLaser(game, target, dmg, mx, my) {
     const s = this.stats;
     if (s.pierce > 1) {
       const a = Math.atan2(target.y - this.y, target.x - this.x);
       const ux = Math.cos(a), uy = Math.sin(a);
-      const hits = this.lineHits(game, this.x, this.y, ux, uy, this.reach(game, ux, uy, this.range), 6).filter((e) => this.canHit(e)).slice(0, s.pierce);
+      const hits = this.lineHits(game, this.x, this.y, ux, uy, this.reach(game, ux, uy, this.range, true), 6, this.reach(game, ux, uy, this.range))
+        .filter((e) => this.canHit(e)).slice(0, s.pierce);
       for (const e of hits) this.hit(game, e, dmg);
       const end = hits[hits.length - 1] || target;
       game.fx.beam(mx, my, end.x, end.y, this.def.color, 3 + this.level, 0.1, { tower: this, target: end, pierce: true });
@@ -539,14 +680,19 @@ export class Tower {
     game.fx.sparks(target.x, target.y, this.def.color, 3, 80);
   }
 
+  // Flight time of a mortar shell to (x, y).
+  shellTime(x, y) { return Math.max(0.25, Math.hypot(x - this.x, y - this.y) / (7 * TILE)); }
+
   launchShell(game, target, dmg, mx, my) {
     const lead = Math.hypot(target.x - this.x, target.y - this.y) / (7 * TILE);
     const sp = target.speed * TILE * (target.stunT > 0 ? 0 : 1);
+    this.lobShell(game, target.x + Math.cos(target.angle) * sp * lead, target.y + Math.sin(target.angle) * sp * lead, dmg, mx, my, Math.max(0.25, lead));
+  }
+
+  lobShell(game, tx, ty, dmg, mx, my, dur = this.shellTime(tx, ty)) {
     game.projectiles.push({
-      kind: 'plasma', x0: mx, y0: my, id: nextId++, t: 0,
-      tx: target.x + Math.cos(target.angle) * sp * lead,
-      ty: target.y + Math.sin(target.angle) * sp * lead,
-      dur: Math.max(0.25, lead), dmg, splash: this.stats.splash * TILE, tower: this, color: this.def.color,
+      kind: 'plasma', x0: mx, y0: my, id: nextId++, t: 0, tx, ty,
+      dur, dmg, splash: this.stats.splash * TILE, tower: this, color: this.def.color,
     });
   }
 
@@ -571,7 +717,7 @@ export class Tower {
       for (const e of game.enemies) {
         if (hit.has(e) || !this.canHit(e)) continue;
         const d2 = (e.x - cur.x) ** 2 + (e.y - cur.y) ** 2;
-        if (d2 < bd && game.los(cur.x, cur.y, e.x, e.y)) { bd = d2; next = e; }
+        if (d2 < bd && game.los(cur.x, cur.y, e.x, e.y, cur.flying || e.flying)) { bd = d2; next = e; }
       }
       if (!next) break;
       if (!cold) mult *= s.falloff;
@@ -583,38 +729,47 @@ export class Tower {
     game.fx.bolt(pts, burst ? '#ffffff' : this.def.color, burst ? 0.22 : 0.14, { tower: this, targets: [...hit], burst });
   }
 
+  // A slug's line at angle `a`: full length, how far it gets before a building, and how far over the low-rise blocks
+  // (for the flyers above them).
+  railLine(game, a) {
+    const ux = Math.cos(a), uy = Math.sin(a);
+    const len = Math.min(this.range, 30 * TILE) + TILE;
+    return { ux, uy, len, reach: this.reach(game, ux, uy, len), reachAir: this.reach(game, ux, uy, len, true) };
+  }
+
   fireRail(game, dmg, mx, my) {
     const s = this.stats;
-    const len = Math.min(this.range, 30 * TILE) + TILE;
     const n = s.slugs;
     for (let i = 0; i < n; i++) {
-      const a = this.angle + (i - (n - 1) / 2) * 0.1;
-      const ux = Math.cos(a), uy = Math.sin(a);
-      const reach = this.reach(game, ux, uy, len);
+      const { ux, uy, len, reach, reachAir } = this.railLine(game, this.angle + (i - (n - 1) / 2) * 0.1);
       // The slug loses power with every enemy it passes through (not the Annihilator's).
-      let k = 1;
-      for (const e of this.lineHits(game, this.x, this.y, ux, uy, reach, 6 * s.beamWidth)) {
+      let k = 1, end = reach;
+      for (const e of this.lineHits(game, this.x, this.y, ux, uy, reachAir, 6 * s.beamWidth, reach)) {
+        // A flyer past a low building: the slug carries on over the roofs.
+        if (e.flying && (e.x - this.x) * ux + (e.y - this.y) * uy > reach) end = reachAir;
         // Exposed: armor-stripped targets take a critical slug.
         const crit = e.stripped && !e.dead;
         if (crit) game.react('exposed', e);
-        this.hit(game, e, dmg * k * (crit ? 1.5 : 1), { pierce: true });
+        // Kinetic slugs spend themselves on energy shields: half effect there (Tesla and EMP are the shield answer).
+        this.hit(game, e, dmg * k * (crit ? 1.5 : 1), { pierce: true, shieldMul: 0.5 });
         k = Math.max(0.5, k - s.slugFalloff);
       }
-      const ex = this.x + ux * reach, ey = this.y + uy * reach;
-      if (reach < len) game.fx.sparks(ex, ey, this.def.color, 10, 140); // slug slams into a building
+      const ex = this.x + ux * end, ey = this.y + uy * end;
+      if (end < len) game.fx.sparks(ex, ey, this.def.color, 10, 140); // slug slams into a building
       game.fx.beam(mx, my, ex, ey, this.def.color, (5 + this.level) * s.beamWidth, 0.28, { tower: this, rail: true, width: s.beamWidth });
     }
     game.fx.sparks(mx, my, '#ffffff', 8, 160);
     game.shake = Math.max(game.shake, 3 * s.beamWidth);
   }
 
-  pulse(game, dmg) {
+  // `load`: advances the reload (see update); only runs while something is in the field.
+  pulse(game, dmg, load) {
     const s = this.stats;
     this.angle += 0.013;
-    if (this.cd > 0) return;
     const r = this.range;
-    const inside = game.enemies.filter((e) => !e.dead && this.inRange(e, r) && this.sees(game, e));
-    if (!inside.length) { this.cd = Math.max(this.cd, 0); return; }
+    const covers = (e) => !e.dead && this.inRange(e, r) && this.sees(game, e);
+    if (!game.enemies.some(covers) || !load()) return;
+    const inside = game.enemies.filter(covers);
     this.cd += 1 / s.rate;
     this.pulses++;
     this.fireFlash = 0.3;
@@ -722,7 +877,12 @@ export class Game {
     const { grid, blocked } = buildGrid(this.map);
     this.grid = grid;
     this.blocked = blocked;
+    // Sky lanes, one per road: wave flyers leave the road's gate but cut across its corners.
+    const tall = blocked.filter(([, , s]) => s > 1);
+    this.airPaths = this.map.paths.map((w) => buildPath(skyLane(w, tall)));
     this.losRects = losRects(blocked);
+    // Flyers cruise above the low-rise blocks: only the tall 2x2 towers block sight to them.
+    this.airRects = losRects(blocked.filter(([, , s]) => s > 1));
     this.credits = this.map.credits;
     this.lives = this.map.lives;
     this.maxLives = this.map.lives;
@@ -757,12 +917,13 @@ export class Game {
 
   waveDef(n) { return n <= WAVES.length ? WAVES[n - 1] : endlessWave(n); }
 
-  // True when no building stands between the two points (pixel space).
-  los(x0, y0, x1, y1) { return segmentBlock(this.losRects, x0, y0, x1, y1) === Infinity; }
+  // True when no building stands between the two points (pixel space). `air`: sight up to a flyer, which only the
+  // tall blocks can hide.
+  los(x0, y0, x1, y1, air = false) { return segmentBlock(air ? this.airRects : this.losRects, x0, y0, x1, y1) === Infinity; }
 
   // Distance a straight shot from (x0, y0) along unit (ux, uy) travels before a building stops it (max len).
-  rayClear(x0, y0, ux, uy, len) {
-    const t = segmentBlock(this.losRects, x0, y0, x0 + ux * len, y0 + uy * len);
+  rayClear(x0, y0, ux, uy, len, air = false) {
+    const t = segmentBlock(air ? this.airRects : this.losRects, x0, y0, x0 + ux * len, y0 + uy * len);
     return t === Infinity ? len : t * len;
   }
 
@@ -838,7 +999,7 @@ export class Game {
     for (const t of this.towers) t.fresh = false;
     const n = this.wave;
     const groups = this.waveDef(n).map((grp) => ({ ...grp, t: -grp.delay, spawned: 0 }));
-    this.spawners.push({ id: n, groups, counter: 0 });
+    this.spawners.push({ id: n, groups, counter: 0, airCounter: 0 });
     this.waveAlive.set(n, 0);
     this.state = 'playing';
     const boss = groups.some((grp) => ENEMIES[grp.type].boss);
@@ -855,8 +1016,8 @@ export class Game {
     return true;
   }
 
-  spawnEnemy(type, pathIdx, waveId, startDist = 0, mods = null) {
-    const e = new Enemy(this, type, pathIdx, waveId, startDist, mods);
+  spawnEnemy(type, pathIdx, waveId, startDist = 0, mods = null, air = false) {
+    const e = new Enemy(this, type, pathIdx, waveId, startDist, mods, air);
     this.enemies.push(e);
     this.waveAlive.set(waveId, (this.waveAlive.get(waveId) || 0) + 1);
     if (e.def.boss) this.hooks.bossSpawn(e);
@@ -1198,9 +1359,11 @@ export class Game {
       for (const grp of s.groups) {
         grp.t += dt;
         while (grp.spawned < grp.count && grp.t >= 0) {
-          const boss = ENEMIES[grp.type].boss;
-          const pathIdx = boss ? 0 : s.counter++ % this.paths.length;
-          this.spawnEnemy(grp.type, pathIdx, s.id, 0, grp.mods);
+          const def = ENEMIES[grp.type];
+          // Flyers take the sky lanes (a boss's own escort drones stay with it on the road).
+          const air = !!def.flying && this.airPaths.length > 0;
+          const pathIdx = def.boss ? 0 : air ? s.airCounter++ % this.airPaths.length : s.counter++ % this.paths.length;
+          this.spawnEnemy(grp.type, pathIdx, s.id, 0, grp.mods, air);
           grp.spawned++;
           grp.t -= grp.gap;
         }
@@ -1305,9 +1468,7 @@ export class Game {
           if (e.dead) continue;
           if ((e.x - s.x) ** 2 + (e.y - s.y) ** 2 <= (s.r + e.radius) ** 2) this.damage(e, s.dmg, { pierce: true });
         }
-        this.fx.emit({ type: 'orbitalhit', x: s.x, y: s.y, r: s.r });
-        this.fx.explosion(s.x, s.y, '#ff2bd6', s.r);
-        this.fx.ring(s.x, s.y, 10, s.r * 1.6, '#ffffff', 0.5, 5);
+        this.fx.emit({ type: 'orbitalhit', x: s.x, y: s.y, r: s.r }); // the renderer builds the whole impact from this
         this.shake = Math.max(this.shake, 14);
         this.hooks.sfx('orbitalhit');
       }

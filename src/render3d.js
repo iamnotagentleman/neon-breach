@@ -14,15 +14,27 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
-import { TILE, COLS, ROWS, TOWERS, ABILITIES, MODS, VET } from './config.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { TILE, COLS, ROWS, TOWERS, ENEMIES, ABILITIES, MODS, VET } from './config.js';
 import { ENEMY_VIS, recolorMaterial } from './assets3d.js';
-import { seededRandom, footprintAnchor, segmentBlock, coverageMap } from './game.js';
+import { seededRandom, footprintAnchor, segmentBlock, coverageMap, pathPoint } from './game.js';
 
 const HW = COLS / 2, HH = ROWS / 2;
 const wx = (px) => px / TILE - HW;
 const wz = (py) => py / TILE - HH;
 const PAD_Y = 0.1;
 const SIGHT_Y = 0.13;
+// Flyers come out of the gate low, climb to cruise above the towers and the low-rise blocks (sky lanes keep clear of
+// the tall ones) and dive down into the core over the last stretch. `dist` / `remaining`: px along the lane.
+// The sky lane guide runs through the middle of the drone's body.
+const CRUISE_Y = 1.9;
+const DIVE_TILES = 1.8;
+const LANE_LIFT = 0.18;
+// Height the orbital strike's satellite lance comes down from.
+const ORBIT_Y = 30;
+const flightAlt = (dist, remaining, hover) => hover + (CRUISE_Y - hover)
+  * THREE.MathUtils.smoothstep(dist / TILE, 1.2, 3.2) * THREE.MathUtils.smoothstep(remaining / TILE, 0, DIVE_TILES);
 // Model scale per footprint: 2x2 heavies read as big installations, not scaled-up 1x1 towers.
 const towerScale = (size, level = 0) => (size > 1 ? 1.95 : 1.15) + level * 0.035 * size;
 // Add-on kit per tower per upgrade path (tiers 1-4; tier 5 swaps the model).
@@ -444,6 +456,26 @@ export class Renderer3D {
     this.sightKey = '';
     this.sightRects = [];
 
+    // Sky lanes (built per map in setGame): a dashed guide at cruise height over a faint trace on the ground.
+    this.laneMat = new LineMaterial({ color: col(ENEMIES.drone.color).clone().multiplyScalar(1.4), linewidth: 1.6, dashed: true, dashSize: 0.34, gapSize: 0.22, transparent: true, opacity: 0.3, depthWrite: false, toneMapped: false });
+    this.laneGroundMat = new LineMaterial({ color: col(ENEMIES.drone.color).clone().multiplyScalar(1.1), linewidth: 1.2, dashed: true, dashSize: 0.12, gapSize: 0.3, transparent: true, opacity: 0.12, depthWrite: false, toneMapped: false });
+    this.skyLanes = [];
+    this.laneK = 0;
+    // The stretch of sky lane an anti-air tower being placed or inspected can hit, in its color.
+    this.airCoverMat = new LineMaterial({ color: 0xffffff, linewidth: 3, transparent: true, depthWrite: false, toneMapped: false });
+    this.airCover = new LineSegments2(new LineSegmentsGeometry(), this.airCoverMat);
+    this.airCoverKey = '';
+    // Manual aim: the Mortar's target spot (a ring the size of its blast) and the Railgun's firing line, solid up to
+    // the first building and dashed where only a slug at a flyer carries on over the low roofs.
+    this.aimRing = this.rangeRing.clone(true);
+    this.aimRing.children.forEach((c) => { c.material = c.material.clone(); });
+    this.aimLineMat = new LineMaterial({ color: 0xffffff, linewidth: 2.5, transparent: true, depthWrite: false, toneMapped: false });
+    this.aimFarMat = new LineMaterial({ color: 0xffffff, linewidth: 1.6, dashed: true, dashSize: 0.16, gapSize: 0.14, transparent: true, opacity: 0.55, depthWrite: false, toneMapped: false });
+    this.aimLine = new Line2(new LineGeometry(), this.aimLineMat);
+    this.aimFar = new Line2(new LineGeometry(), this.aimFarMat);
+    for (const o of [this.airCover, this.aimRing, this.aimLine, this.aimFar]) { o.frustumCulled = false; o.renderOrder = 7; o.visible = false; this.scene.add(o); }
+    this.uiLineMats = [this.laneMat, this.laneGroundMat, this.airCoverMat, this.aimLineMat, this.aimFarMat];
+
     // Shared geometries/materials for pooled effects.
     this.beamGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
     this.beamGeo.translate(0, 0.5, 0);
@@ -537,6 +569,7 @@ export class Renderer3D {
     this.bloom.resolution.set(size.x, size.y);
     for (const m of this.lineMats.values()) m.resolution.set(w, h);
     this.sightLineMat?.resolution.set(w, h);
+    for (const m of this.uiLineMats || []) m.resolution.set(w, h);
     this.fitCamera();
   }
 
@@ -906,6 +939,43 @@ export class Renderer3D {
       }
     });
 
+    // Sky lanes: the drones' flight routes out of each gate. The guide line follows their climb, cruise height and dive
+    // into the core; the ground trace (kept on the board) shows where on the grid it runs.
+    this.skyLanes = [];
+    this.laneWave = '';
+    const droneHover = ENEMY_VIS.drone.hover;
+    const inBoard = (q) => q.x >= 0 && q.y >= 0 && q.x <= COLS * TILE && q.y <= ROWS * TILE;
+    // Where two roads merge their lanes do too: the shared stretch is drawn once.
+    const drawn = [];
+    const addLine = (pos, mat) => {
+      if (pos.length < 6) return;
+      const geo = new LineGeometry();
+      geo.setPositions(pos);
+      const line = new Line2(geo, mat);
+      line.computeLineDistances();
+      line.frustumCulled = false;
+      line.renderOrder = 3;
+      g.add(line);
+      this.skyLanes.push(line);
+    };
+    for (const p of game.airPaths) {
+      let air = [], ground = [];
+      const flush = () => { addLine(air, this.laneMat); addLine(ground, this.laneGroundMat); air = []; ground = []; };
+      const mine = [];
+      for (let d = 0; ; d = Math.min(p.length, d + TILE * 0.2)) {
+        const q = pathPoint(p, d);
+        mine.push(q);
+        if (drawn.some((o) => (o.x - q.x) ** 2 + (o.y - q.y) ** 2 < (TILE * 0.15) ** 2)) flush();
+        else {
+          air.push(wx(q.x), flightAlt(d, p.length - d, droneHover) + LANE_LIFT, wz(q.y));
+          if (inBoard(q)) ground.push(wx(q.x), 0.118, wz(q.y));
+        }
+        if (d >= p.length) break;
+      }
+      flush();
+      drawn.push(...mine);
+    }
+
     // Buildings on blocked tiles.
     const bTpl = this.assets.get('env_building');
     this.buildingViews = [];
@@ -1159,15 +1229,19 @@ export class Renderer3D {
         }
       }
       if (v.barrels) {
-        // Spin up fast while firing, wind down slowly after the last shot; the muzzle flash strobes.
+        // Spin up as soon as there's a target (before the first round), wind down slowly after the last shot; the
+        // muzzle flash strobes while it's shooting.
         const firing = this.time - v.lastShot < 0.25 && t.jamT <= 0;
-        v.spin += ((firing ? 30 : 0) - v.spin) * Math.min(1, dt * (firing ? 5 : 1.2));
+        const spinning = firing || t.engaged;
+        v.spin += ((spinning ? 30 : 0) - v.spin) * Math.min(1, dt * (spinning ? 5 : 1.2));
         v.barrels.rotation.z += v.spin * dt;
         v.flash.material.opacity = firing ? (Math.random() < 0.5 ? 0.8 : 0.3) : 0;
         v.flash.scale.setScalar((firing ? 0.2 + Math.random() * 0.15 : 0.15) * v.size);
       } else {
-        v.flash.material.opacity = Math.min(1, t.fireFlash * 8);
-        v.flash.scale.setScalar((0.35 + t.fireFlash * 3) * v.size);
+        // Slow weapons show their load building at the muzzle (and holding there when loaded and waiting).
+        const load = t.engaged && t.stats.rate < 2 ? THREE.MathUtils.smoothstep(t.charge, 0.3, 1) * 0.45 : 0;
+        v.flash.material.opacity = Math.max(load, Math.min(1, t.fireFlash * 8));
+        v.flash.scale.setScalar((0.35 + t.fireFlash * 3 + load * 0.4) * v.size);
       }
       if (v.light) v.light.intensity = t.fireFlash > 0 ? 2.5 + Math.random() * 2.5 : 0.6;
       if (v.orb) v.orb.scale.setScalar(v.orb.userData.base + Math.sin(this.time * 9 + t.id) * 0.04 + t.fireFlash * 0.8 * v.size);
@@ -1288,8 +1362,9 @@ export class Renderer3D {
     return { root, inner, obj, mixer, action, mats, vis, shield, shieldSize, packet, jamDisc, height, yaw: yawOf(e.angle), cloaked: false, slowed: false, age: 0, healT: Math.random(), jamPulse: Math.random() };
   }
 
+  // Middle of the model: the root already sits at the enemy's hover / flight height.
   enemyCenter(v, out) {
-    return out.copy(v.root.position).add(tmpV2.set(0, (v.vis.hover || 0) + v.height * 0.5, 0));
+    return out.copy(v.root.position).add(tmpV2.set(0, v.height * 0.5, 0));
   }
 
   syncEnemies(game, dt) {
@@ -1303,7 +1378,15 @@ export class Renderer3D {
       v.root.scale.setScalar(sp < 1 ? 0.3 + sp * 0.7 : 1);
       const hover = v.vis.hover || 0;
       const bob = hover ? Math.sin(this.time * 3 + e.id) * 0.05 : v.vis.crawl ? Math.abs(Math.sin(this.time * 14 + e.id)) * 0.02 : 0;
-      v.root.position.set(wx(e.x), hover + bob, wz(e.y));
+      let y = hover;
+      if (e.flying) {
+        // Up from the gate to cruise height, diving into the core; escorts launched from a boss on the road climb too.
+        const want = flightAlt(e.dist, e.remaining, hover);
+        if (v.alt == null) v.alt = e.air ? want : hover;
+        v.alt += (want - v.alt) * Math.min(1, dt * 2.5);
+        y = v.alt;
+      }
+      v.root.position.set(wx(e.x), y + bob, wz(e.y));
       v.yaw = lerpAngle(v.yaw, yawOf(e.angle), Math.min(1, dt * 10));
       v.inner.rotation.y = v.vis.spin ? v.inner.rotation.y + dt * 0.4 : v.yaw;
       if (v.vis.tilt) v.inner.rotation.x = e.stunT > 0 ? 0 : 0.22;
@@ -1694,6 +1777,113 @@ export class Renderer3D {
     this.flashLight(x, y + 0.3, z, color, 12 + size * 20, 3 + size * 4, 0.25);
   }
 
+  // -------------------------------------------------------------------------------- orbital strike
+  // Lock-on while the strike charges: a satellite glint brightening high overhead, the targeting laser tightening
+  // onto the spot, the ground heating up under it, energy motes spiralling in from the blast edge and up the beam,
+  // the lock ring closing, and a rumble that builds.
+  orbitalCharge(x, z, r, delay) {
+    const color = ABILITIES.orbital.color;
+    const glint = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex.flare, color: col('#ffb3ec').clone().multiplyScalar(2), blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, opacity: 0 }));
+    glint.position.set(x, ORBIT_Y * 0.8, z);
+    glint.renderOrder = 12;
+    this.addFx(glint, delay + 0.1, (k) => { const t = 1 - k; glint.material.opacity = Math.min(1, t * 1.6); glint.scale.setScalar(1.2 + t * 2.2 + Math.sin(this.time * 30) * 0.15); });
+    const laser = this.beamKit.make(new THREE.Vector3(x, ORBIT_Y, z), new THREE.Vector3(x, 0, z), color, 0.03, 2.4);
+    const u = laser.material.uniforms;
+    this.addFx(laser, delay, (k) => {
+      const t = 1 - k;
+      u.uTime.value = this.time;
+      u.uWidth.value = 0.03 + t * t * 0.3;
+      u.uFade.value = (0.3 + t * 0.7) * (0.85 + Math.random() * 0.15); // flickers as it locks
+    });
+    const heat = new THREE.Mesh(this.decalGeo, new THREE.MeshBasicMaterial({ map: glowTexture, color: col(color).clone().multiplyScalar(1.6), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, opacity: 0 }));
+    heat.position.set(x, 0.05, z);
+    heat.renderOrder = 4;
+    this.addFx(heat, delay, (k) => { const t = 1 - k; heat.material.opacity = t * t * 0.9; heat.scale.setScalar(r * (2.6 - t * 1.2)); });
+    this.shockwave(x, z, r * 1.7, r, color, delay, 1, 0.08);
+    let last = this.time;
+    this.addFx(new THREE.Object3D(), delay, (k) => {
+      const t = 1 - k;
+      this.shakeT = Math.max(this.shakeT, t * 0.22);
+      const dt = this.time - last;
+      last = this.time;
+      if (this.fxBusy) return;
+      // Motes drawn in from the edge of the blast and up into the beam, more of them as the charge peaks.
+      RAMP_A.copy(col('#ffd6f5')).multiplyScalar(4);
+      RAMP_B.copy(col(color)).multiplyScalar(1.4);
+      for (let n = Math.round(dt * (80 + 220 * t)); n > 0; n--) {
+        const a = Math.random() * TAU, d = r * (1 + Math.random() * 0.7);
+        const px = x + Math.cos(a) * d, pz = z + Math.sin(a) * d;
+        this.sparks.add(px, 0.08, pz, {
+          vel: [(x - px) * 2.2 - Math.sin(a) * 1.2, 0.3 + Math.random() * 0.6, (z - pz) * 2.2 + Math.cos(a) * 1.2],
+          color: RAMP_A, end: RAMP_B, size: 0.06, endSize: 0.02, life: 0.45, grav: 9, drag: 1.2, stretch: 0.7,
+        });
+      }
+    });
+  }
+
+  // Impact: a white-hot lance slams down with a wide glow around it, a ground flash and two shock fronts race out,
+  // ion arcs crackle across the ground, debris and embers fly, and a smoke column climbs. Then the lance lifts off
+  // back to orbit, leaving a molten crater that cools from white to red, and a scorch mark.
+  orbitalImpact(x, z, r) {
+    const color = ABILITIES.orbital.color;
+    const ground = new THREE.Vector3(x, 0, z), sky = new THREE.Vector3(x, ORBIT_Y, z);
+    const LANCE = 1.15;
+    const lance = this.beamKit.make(ground, sky, color, r * 0.6, 2.2);
+    const lu = lance.material.uniforms;
+    lu.uCore.value = 1.5;
+    this.addFx(lance, LANCE, (k) => {
+      const t = 1 - k;
+      lu.uTime.value = this.time;
+      // Punches in at full width, throbs while it burns, then thins out as it lifts from the ground up.
+      const punch = Math.min(1, t / 0.06);
+      const thin = t < 0.45 ? 1 : 1 - (t - 0.45) / 0.55;
+      lu.uWidth.value = r * 0.6 * punch * (0.25 + 0.75 * thin) * (1 + Math.sin(this.time * 38) * 0.07);
+      lu.uFade.value = Math.min(1, k * 3);
+      lu.uCut.value = t < 0.5 ? -0.2 : -0.2 + ((t - 0.5) / 0.5) * 1.3;
+    });
+    const halo = this.beamKit.make(ground, sky, color, r * 1.1, 0.3);
+    const hu = halo.material.uniforms;
+    hu.uCore.value = 0;
+    this.addFx(halo, 0.45, (k) => { hu.uTime.value = this.time; hu.uFade.value = k * k; hu.uWidth.value = r * (1.1 + (1 - k) * 0.6); });
+    // Flash.
+    this.flare(x, 0.6, z, '#ffffff', 1.2 + r * 0.6, 0.12, 2.5);
+    this.flare(x, 0.6, z, color, 1.6 + r * 0.8, 0.35, 1.5);
+    this.flashLight(x, 1.5, z, '#ff7ae0', 12, 3 + r * 1.5, 0.4);
+    this.aberrationKick = 1;
+    this.shakeT = Math.max(this.shakeT, 1.1);
+    // Shock fronts: a fast white one, then the magenta wave.
+    this.shockwave(x, z, 0.1, r * 2.2, '#ffffff', 0.3, 0.45, 0.1);
+    this.shockwave(x, z, 0.2, r * 3.4, color, 0.8, 0.55, 0.09);
+    // An energy burst rather than a fireball: this is a lance, not a shell.
+    this.flipbook(new THREE.Vector3(x, 0.5, z), 'burst', r * 1.3, 0.45, color, 1.6, true);
+    // Ion arcs crawling out across the ground from the impact.
+    if (!this.fxBusy) {
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * TAU + Math.random() * 0.8, d = r * (1 + Math.random() * 0.6);
+        const mid = new THREE.Vector3(x + Math.cos(a) * d * 0.5, 0.25 + Math.random() * 0.3, z + Math.sin(a) * d * 0.5);
+        this.lightning([new THREE.Vector3(x, 0.2, z), mid, new THREE.Vector3(x + Math.cos(a) * d, 0.08, z + Math.sin(a) * d)], '#ff9ee8', 0.35 + Math.random() * 0.25, { width: 2.2 });
+      }
+    }
+    // Debris, embers and a climbing smoke column.
+    this.sparkBurst(x, 0.2, z, '#ffffff', 60, 10, { life: 0.9, size: 0.05, up: 0.75, heat: 0.8 });
+    this.sparkBurst(x, 0.15, z, color, 40, 6, { life: 1.2, size: 0.045, up: 0.35, grav: -6 });
+    this.sparkBurst(x, 0.2, z, '#ffb070', 30, 4, { life: 2.2, size: 0.05, up: 0.9, grav: -3, drag: 1.4, stretch: 0.4, heat: 0.4, glow: 3 });
+    this.smokePuff(x, 0.2, z, 14, { size: 0.6, grow: 2.6, spread: r * 0.7, rise: 2.2, life: 3, alpha: 0.5, warm: 1 });
+    this.smokePuff(x, 0.1, z, 8, { size: 0.35, grow: 2, spread: r * 1.6, rise: 0.25, life: 1.6, alpha: 0.35, warm: 0.4 });
+    // Molten crater: white-hot, cooling through orange to a dull red glow, over a big scorch.
+    const crater = new THREE.Mesh(this.decalGeo, new THREE.MeshBasicMaterial({ map: glowTexture, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false }));
+    crater.position.set(x, 0.045, z);
+    crater.scale.setScalar(r * 1.5);
+    crater.renderOrder = 4;
+    const hot = new THREE.Color(1.5, 1.15, 1), warm = new THREE.Color(1.3, 0.42, 0.12), cool = new THREE.Color(0.5, 0.07, 0.04);
+    this.addFx(crater, 3.2, (k) => {
+      const t = 1 - k;
+      crater.material.color.copy(t < 0.12 ? hot.clone().lerp(warm, t / 0.12) : warm.clone().lerp(cool, (t - 0.12) / 0.88));
+      crater.material.opacity = Math.min(1, k * 1.6);
+    });
+    this.scorch(x, z, r * 2.6, 12);
+  }
+
   processEvents(game) {
     const evs = game.fx.events;
     if (!evs.length) return;
@@ -2019,24 +2209,8 @@ export class Renderer3D {
           this.sparkBurst(x, 0.4, z, '#7df9ff', 40, r * 4, { life: 0.6, size: 0.04, up: 0.3, grav: -4 });
           break;
         }
-        case 'orbital': {
-          // Targeting: a thin beam from orbit that thickens while it charges, and a ring closing in.
-          const x = wx(ev.x), z = wz(ev.y), r = ev.r / TILE;
-          const m = this.beamKit.make(new THREE.Vector3(x, 30, z), new THREE.Vector3(x, 0, z), '#ff2bd6', 0.05, 2.2);
-          const u = m.material.uniforms;
-          this.addFx(m, ev.delay, (k) => { const t = 1 - k; u.uTime.value = this.time; u.uWidth.value = 0.04 + t * 0.25; u.uFade.value = 0.35 + t * 0.65; });
-          this.shockwave(x, z, r * 1.6, r, '#ff2bd6', ev.delay, 1, 0.08);
-          break;
-        }
-        case 'orbitalhit': {
-          const x = wx(ev.x), z = wz(ev.y), r = ev.r / TILE;
-          this.beam(new THREE.Vector3(x, 30, z), new THREE.Vector3(x, 0, z), '#ff2bd6', r * 0.9, 0.6, { core: 2, dissolve: true, intensity: 3 });
-          this.explosion(x, 0.4, z, '#ff2bd6', r * 0.9);
-          this.sparkBurst(x, 0.2, z, '#ffffff', 50, 8, { life: 0.9, size: 0.05, up: 0.7 });
-          this.smokePuff(x, 0.2, z, 10, { size: 0.6, grow: 2.4, spread: r * 0.8, rise: 1.2, life: 2.4, alpha: 0.45, warm: 1 });
-          this.shakeT = Math.max(this.shakeT, 0.8);
-          break;
-        }
+        case 'orbital': this.orbitalCharge(wx(ev.x), wz(ev.y), ev.r / TILE, ev.delay); break;
+        case 'orbitalhit': this.orbitalImpact(wx(ev.x), wz(ev.y), ev.r / TILE); break;
       }
     }
     evs.length = 0;
@@ -2091,6 +2265,7 @@ export class Renderer3D {
     this.gridMat.uniforms.time.value = t;
 
     this.processEvents(game);
+    this.updateSkyLanes(game, realDt);
     this.syncTowers(game, simDt, ui);
     this.syncEnemies(game, simDt);
     this.syncShells(game);
@@ -2146,6 +2321,9 @@ export class Renderer3D {
     if (this.shadowTimer <= 0) { this.renderer.shadowMap.needsUpdate = true; this.shadowTimer = 0.05; }
     this.finalPass.uniforms.time.value = t;
     this.finalPass.uniforms.hit.value = Math.max(this.coreHit || 0, game.coreHit || 0);
+    // Orbital impacts shear the image for a moment.
+    this.aberrationKick = Math.max(0, (this.aberrationKick || 0) - realDt * 2.5);
+    this.finalPass.uniforms.aberration.value = 0.0012 + 0.006 * this.aberrationKick ** 2;
     // Close up, neon fills much more of the screen, so bloom backs off as the camera zooms in.
     const zoom = this.fitDist ? this.camera.position.distanceTo(this.controls.target) / this.fitDist : 1;
     const near = 1 - THREE.MathUtils.smoothstep(zoom, 0.28, 1);
@@ -2155,6 +2333,80 @@ export class Renderer3D {
     this.camera.position.copy(base);
 
     this.drawOverlay(game, ui, realDt);
+  }
+
+  // Sky lanes brighten and their dashes flow faster while drones are on them or the next wave brings some.
+  updateSkyLanes(game, dt) {
+    if (!this.skyLanes.length) return;
+    const key = `${game.wave}|${game.endless}`; // continuing into endless opens up the next wave without a new one
+    if (this.laneWave !== key) {
+      this.laneWave = key;
+      this.laneNext = !game.campaignDone && game.waveDef(game.wave + 1).some((grp) => ENEMIES[grp.type].flying);
+    }
+    const hot = game.enemies.some((e) => e.air) || (game.state === 'build' && this.laneNext);
+    this.laneK += ((hot ? 1 : 0) - this.laneK) * Math.min(1, dt * 3);
+    this.laneMat.opacity = 0.34 + 0.32 * this.laneK;
+    this.laneGroundMat.opacity = 0.14 + 0.14 * this.laneK;
+    this.laneMat.dashOffset -= dt * (0.3 + 1.1 * this.laneK);
+    this.laneGroundMat.dashOffset = this.laneMat.dashOffset;
+  }
+
+  // Sky lane stretch a tower at (px, py) with range r (px) can hit: in range, and not behind a tall block.
+  showAirCover(game, px, py, r, walls, color) {
+    const key = `${px}|${py}|${r}|${walls}`;
+    if (key !== this.airCoverKey) {
+      this.airCoverKey = key;
+      const pos = [];
+      const hover = ENEMY_VIS.drone.hover;
+      for (const p of game.airPaths) {
+        let prev = null;
+        for (let d = 0; d <= p.length; d += TILE * 0.2) {
+          const q = pathPoint(p, d);
+          const ok = (q.x - px) ** 2 + (q.y - py) ** 2 <= r * r && (!walls || game.los(px, py, q.x, q.y, true));
+          const pt = [wx(q.x), flightAlt(d, p.length - d, hover) + LANE_LIFT, wz(q.y)];
+          if (ok && prev) pos.push(...prev, ...pt);
+          prev = ok ? pt : null;
+        }
+      }
+      this.airCoverEmpty = !pos.length;
+      if (pos.length) {
+        const geo = new LineSegmentsGeometry();
+        geo.setPositions(pos);
+        this.airCover.geometry.dispose();
+        this.airCover.geometry = geo;
+      }
+    }
+    if (this.airCoverEmpty) return;
+    this.airCoverMat.color.copy(col(color)).multiplyScalar(2.2);
+    this.airCover.visible = true;
+  }
+
+  // Manual aim of tower `t` at point `pt` (px): the Mortar's blast ring, or the Railgun's firing line on the ground.
+  showAim(game, t, pt, bright) {
+    const c = col(t.def.color);
+    if (t.type === 'plasma') {
+      this.aimRing.visible = true;
+      this.aimRing.position.set(wx(pt.x), 0.15, wz(pt.y));
+      this.aimRing.scale.setScalar(t.stats.splash);
+      this.aimRing.children[0].material.color.copy(c).multiplyScalar(2.5 * bright);
+      this.aimRing.children[1].material.color.copy(c).multiplyScalar(bright);
+      return;
+    }
+    const { ux, uy, reach, reachAir } = t.railLine(game, Math.atan2(pt.y - t.y, pt.x - t.x));
+    const y = SIGHT_Y + 0.012;
+    const at = (d) => [wx(t.x + ux * d), y, wz(t.y + uy * d)];
+    const start = TILE * t.size * 0.5;
+    this.aimLine.geometry.dispose();
+    this.aimLine.geometry = new LineGeometry().setPositions([...at(start), ...at(reach)]);
+    this.aimLineMat.color.copy(c).multiplyScalar(2.2 * bright);
+    this.aimLine.visible = reach > start;
+    if (reachAir > reach + 1) {
+      this.aimFar.geometry.dispose();
+      this.aimFar.geometry = new LineGeometry().setPositions([...at(reach), ...at(reachAir)]);
+      this.aimFar.computeLineDistances();
+      this.aimFarMat.color.copy(c).multiplyScalar(1.6 * bright);
+      this.aimFar.visible = true;
+    }
   }
 
   // Buildings as world-space rectangles, inset like the game's line-of-sight test.
@@ -2244,11 +2496,11 @@ export class Renderer3D {
     this.heatMesh.visible = true;
   }
 
-  // Coverage (tiles of road in view) for a tower anchored at (tx, ty), from the current heat map.
+  // Coverage (score, tiles of road and of sky lane in view) for a tower anchored at (tx, ty), from the current heat map.
   heatAt(type, tx, ty) {
     if (this.heat.type !== type || !this.heat.data || tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return null;
-    const v = this.heat.data[ty * COLS + tx];
-    return v < 0 ? null : { v, k: v / this.heat.max };
+    const i = ty * COLS + tx, v = this.heat.data[i];
+    return v < 0 ? null : { v, k: v / this.heat.max, road: this.heat.data.road[i], air: this.heat.data.air[i] };
   }
 
   updateCursor(game, ui) {
@@ -2266,10 +2518,19 @@ export class Renderer3D {
     this.sightFill.visible = this.sightLine.visible = false;
     this.reticle.visible = false;
     this.heatMesh.visible = false;
+    this.airCover.visible = this.aimRing.visible = this.aimLine.visible = this.aimFar.visible = false;
     if (ui.placing && this.settings.heatmap) this.updateHeat(game, ui.placing);
     if (this.ghosts) for (const g of Object.values(this.ghosts)) g.visible = false;
     const sel = ui.selected;
     if (sel) this.showSight(wx(sel.x), wz(sel.y), sel.range / TILE, sel.def.color, !sel.ignoresWalls);
+    if (sel && (sel.def.air || sel.stats.air)) this.showAirCover(game, sel.x, sel.y, sel.range, !sel.ignoresWalls, sel.def.color);
+    // Manual aim: the inspected tower's spot / line, or a live preview under the cursor while one is being picked.
+    const aimer = ui.aiming || (sel?.aiming ? sel : null);
+    if (aimer) {
+      const pt = ui.aiming && h && h.tx >= 0 ? aimer.aimAt(h.x, h.y) : aimer.aim;
+      if (pt) this.showAim(game, aimer, pt, ui.aiming ? 1 : 0.6);
+      if (ui.aiming) return;
+    }
     if (!h) return;
     if (ui.ability) {
       const ab = ABILITIES[ui.ability];
@@ -2296,6 +2557,7 @@ export class Renderer3D {
       this.tileMarker.scale.setScalar(size);
       this.tileMarker.material.color.set(ok ? '#39ff14' : '#ff3355').multiplyScalar(2);
       if (!sel) this.showSight(fx, fz, def.base.range, def.color, ui.placing !== 'plasma' && ui.placing !== 'uplink', ok ? 1 : 0.3);
+      if (!sel && def.air && fits) this.showAirCover(game, (a.tx + size / 2) * TILE, (a.ty + size / 2) * TILE, def.base.range * TILE, ui.placing !== 'plasma', def.color);
       const gh = this.ghost(ui.placing);
       gh.visible = fits;
       gh.position.set(fx, PAD_Y, fz);

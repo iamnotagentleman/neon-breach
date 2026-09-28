@@ -1,5 +1,5 @@
 import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, MODS, VET, REACTIONS, TILE, W, H, computeStats, endlessMutators } from './config.js';
-import { Game, footprintAnchor, coreDamage } from './game.js';
+import { Game, footprintAnchor, coreDamage, AIR_HEAT_WEIGHT } from './game.js';
 import { Renderer } from './render.js';
 import { Renderer3D } from './render3d.js';
 import { AssetLibrary } from './assets3d.js';
@@ -9,6 +9,9 @@ import { TitleFx } from './titlefx.js';
 const $ = (sel) => document.querySelector(sel);
 const SAVE_KEY = 'neonbreach.save';
 const MODES = [['first', 'FIRST'], ['last', 'LAST'], ['strong', 'STRONG'], ['close', 'CLOSE']];
+// Mortars and Railguns can also hold a manual aim: a ground spot / a firing line (G sets it).
+const AIM_MODE = ['aim', 'AIM'];
+const modesFor = (t) => (t.aimable ? [...MODES, AIM_MODE] : MODES);
 const ABILITY_ICONS = { emp: '⌁', orbital: '✦', overclock: '⚡' };
 // Portraits rendered from the 3D models in Blender (tools/blender/render_icons.py).
 const towerIcon = (t) => `assets/icons/tower_${t}.webp`;
@@ -50,7 +53,8 @@ let modalOpen = false;
 let autoT = 0; // countdown to an auto-launched wave
 let introWave = 0; // last wave whose boss got an intro
 let pendingIntro = null; // boss waiting to clear its spawn portal before the intro starts
-const ui = { hover: null, placing: null, selected: null, selectedEnemy: null, ability: null, shift: false, previewPath: null };
+// `aiming`: the Mortar / Railgun whose manual aim the next click sets.
+const ui = { hover: null, placing: null, selected: null, selectedEnemy: null, ability: null, shift: false, previewPath: null, aiming: null };
 
 // ---------------------------------------------------------------- screens
 function show(name) {
@@ -383,9 +387,13 @@ function updateHud() {
     const a = h && h.tx >= 0 ? footprintAnchor(size, h.x, h.y) : null;
     const v = a && r3d.heatAt(ui.placing, a.tx, a.ty);
     const unit = ui.placing === 'uplink' ? 'tower levels in range' : 'tiles of road in view';
+    // Anti-air towers also score the sky lane they'd cover (at a lower weight: only drones fly it).
+    const air = v && v.air > 0 ? ` + <b style="color:${ENEMIES.drone.color}">${v.air.toFixed(1)}</b> of sky lane` : '';
     const html = !settings.heatmap ? 'Heat map off (H)' : v
-      ? `<b style="color:${v.k > 0.66 ? 'var(--green)' : v.k > 0.33 ? 'var(--yellow)' : 'var(--red)'}">${v.v.toFixed(1)}</b> ${unit} · ${Math.round(v.k * 100)}% of the best spot`
-      : 'Heat map: green pads cover the most road';
+      ? `<b style="color:${v.k > 0.66 ? 'var(--green)' : v.k > 0.33 ? 'var(--yellow)' : 'var(--red)'}">${v.road.toFixed(1)}</b> ${unit}${air} · ${Math.round(v.k * 100)}% of the best spot`
+      : TOWERS[ui.placing].air && game.airPaths.length
+        ? `Heat map: green pads cover the most road (sky lane counts ×${AIR_HEAT_WEIGHT})`
+        : 'Heat map: green pads cover the most road';
     if (hl.dataset.h !== html) { hl.dataset.h = html; hl.innerHTML = html; }
   }
 }
@@ -530,7 +538,7 @@ const COUNTERS = {
   runner: 'Anything works — Pulse Lasers are the most cost-efficient answer.',
   drone: 'Airborne: Lasers, Tesla, Cryo and Railguns hit it. Plasma Mortars cannot.',
   brute: 'Armor blunts weak hits. Railguns ignore armor; heavy Plasma shells punch through.',
-  aegis: 'Shield regenerates after 2s without damage. Tesla deals 3× to shields; EMP strips them.',
+  aegis: 'Shield regenerates after 2s without damage. Tesla deals 3× to shields; EMP strips them; Railgun slugs do half.',
   phantom: 'Always cloaked: needs camo detection (Laser Hack, Rail Thermal Scope, Hive Mind) or a Netrunner Uplink field. EMP and freezes expose it; cryo and splash still hit it.',
   splitter: 'Bursts into 3 Nano-Mites — keep splash or chain damage behind it.',
   mite: 'Fast and fragile — Tesla chains and Cryo pulses sweep them up.',
@@ -620,9 +628,25 @@ function updateEnemyPanel(e) {
 function cycleTargeting() {
   const t = ui.selected;
   if (!t || t.type === 'uplink' || t.type === 'cryo') return;
-  const i = MODES.findIndex(([m]) => m === t.mode);
-  t.mode = MODES[(i + 1) % MODES.length][0];
+  const modes = modesFor(t);
+  const next = modes[(modes.findIndex(([m]) => m === t.mode) + 1) % modes.length][0];
+  // AIM needs a spot first: cycling onto it without one asks for a click.
+  if (next === 'aim' && !t.aim) { beginAim(t); return; }
+  t.mode = next;
+  ui.aiming = null;
   audio.play('click');
+}
+
+// Manual aim (G): the next click on the board sets the Mortar's target spot or the Railgun's firing line.
+function beginAim(t = ui.selected) {
+  if (!t || !t.aimable) return;
+  if (ui.aiming === t) { ui.aiming = null; renderInfo(true); return; }
+  ui.aiming = t;
+  ui.placing = null;
+  ui.ability = null;
+  audio.play('click');
+  toast(t.type === 'plasma' ? 'CLICK A SPOT FOR THE MORTAR TO SHELL' : 'CLICK TO SET THE RAILGUN\'S FIRING LINE', t.def.color, 2000);
+  renderInfo(true);
 }
 
 function renderInfo(force) {
@@ -648,7 +672,7 @@ function renderInfo(force) {
   const previewType = ui.shopHover || ui.placing;
   const afford = sel ? [0, 1, 2].map((i) => (sel.nextTier(i) && game.credits >= sel.nextTier(i).cost ? 1 : 0)).join('') : '';
   const key = sel
-    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}|${sel.rank}|${sel.fresh}`
+    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}|${sel.rank}|${sel.fresh}|${ui.aiming === sel}`
     : previewType ? `prev|${previewType}` : 'empty';
   if (key !== infoKey || force) {
     infoKey = key;
@@ -672,12 +696,15 @@ function renderInfo(force) {
         ${statRows(def, sel.stats, preview, true)}
         ${comboChips(sel.type)}
         <div class="paths">${def.paths.map((p, i) => pathCard(sel, p, i)).join('')}</div>
-        <div class="actions${aims ? '' : ' one'}">
-          ${aims ? `<button class="btn target" id="btn-target" title="Targeting priority (T)"><span>◎ ${MODES.find(([m]) => m === sel.mode)[1]}</span></button>` : ''}
+        <div class="actions${aims ? '' : ' one'}${sel.aimable ? ' aimable' : ''}">
+          ${aims ? `<button class="btn target" id="btn-target" title="Targeting priority (T)"><span>◎ ${modesFor(sel).find(([m]) => m === sel.mode)[1]}</span></button>` : ''}
+          ${sel.aimable ? `<button class="btn target aim${ui.aiming === sel ? ' on' : ''}" id="btn-aim" title="${sel.type === 'plasma' ? 'Shell a ground spot of your choice (G)' : 'Fire down a line of your choice (G)'}"><span>⌖ SET AIM</span></button>` : ''}
           <button class="btn sell" id="btn-sell" title="${sellTip}"><span>SELL +${sel.sellValue}¢${sel.fresh ? ' <i class="fresh">FULL</i>' : ''}</span></button>
-        </div>`;
+        </div>
+        ${ui.aiming === sel ? `<div class="aim-hint">${sel.type === 'plasma' ? 'Click a spot in range: shells land there whenever an enemy is about to be in the blast.' : 'Click a direction: slugs fire down that line whenever an enemy is on it.'} Right-click cancels.</div>` : ''}`;
       panel.querySelector('#btn-sell').addEventListener('click', () => doSell());
       panel.querySelector('#btn-target')?.addEventListener('click', () => { cycleTargeting(); renderInfo(true); });
+      panel.querySelector('#btn-aim')?.addEventListener('click', () => beginAim(sel));
       panel.querySelectorAll('[data-up]').forEach((b) => {
         const i = Number(b.dataset.up);
         b.addEventListener('click', () => doUpgrade(i));
@@ -695,7 +722,8 @@ function renderInfo(force) {
       panel.style.removeProperty('--c');
       panel.innerHTML = `<div class="panel-title">SYSTEM</div><div class="info-empty">
         Select a defense (<b>1–6</b>) and click an empty tile to deploy — the heat map shows where it sees the most road.<br>
-        Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget.<br>
+        Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget · <b>G</b> aim a Mortar / Railgun by hand.<br>
+        Drones leave the gates but cut the corners on <b>sky lanes</b> (the dashed lines), over the low blocks.<br>
         Buildings block line of sight — a tower's range area only covers what it can see.<br>
         <b>SPACE</b> launches waves — calling early pays a bonus · <b>A</b> auto-launch.<br>
         <b>Q W E</b> abilities · <b>F</b> speed (up to 4×) · <b>H</b> heat map · <b>P</b> pause · <b>RMB/ESC</b> cancel.<br>
@@ -742,6 +770,7 @@ function selectBuild(type) {
   ui.ability = null;
   ui.selected = null;
   ui.selectedEnemy = null;
+  ui.aiming = null;
   ui.placing = ui.placing === type ? null : type;
   if (ui.placing && game.credits < TOWERS[type].cost) toast('INSUFFICIENT CREDITS', '#ff3355');
   renderInfo(true);
@@ -756,6 +785,7 @@ function armAbility(key) {
   }
   ui.placing = null;
   ui.selected = null;
+  ui.aiming = null;
   ui.ability = ui.ability === key ? null : key;
   audio.play('click');
   renderInfo(true);
@@ -781,6 +811,7 @@ function doSell() {
   if (t.fresh) toast(`FULL REFUND +${t.sellValue}¢`, '#39ff14', 1400);
   game.sell(t);
   ui.selected = null;
+  ui.aiming = null;
   renderInfo(true);
 }
 
@@ -856,6 +887,15 @@ canvas.addEventListener('pointerdown', (ev) => {
     else audio.play('error');
     return;
   }
+  if (ui.aiming) {
+    const t = ui.aiming;
+    if (p.tx < 0 || !t.setAim(p.x, p.y)) { audio.play('error'); return; }
+    ui.aiming = null;
+    ui.selected = t;
+    audio.play('click');
+    renderInfo(true);
+    return;
+  }
   if (ui.placing) {
     const type = ui.placing;
     const size = TOWERS[type].size || 1;
@@ -885,6 +925,8 @@ canvas.addEventListener('pointerdown', (ev) => {
 });
 
 function cancel() {
+  // Picking an aim point: back out of just that, keeping the tower selected.
+  if (ui.aiming) { ui.aiming = null; renderInfo(true); return true; }
   if (ui.ability || ui.placing || ui.selected || ui.selectedEnemy) {
     ui.ability = null;
     ui.placing = null;
@@ -923,6 +965,7 @@ window.addEventListener('keydown', (ev) => {
     case '/': ev.preventDefault(); doUpgrade(2); break;
     case 's': case 'delete': case 'backspace': doSell(); break;
     case 't': cycleTargeting(); renderInfo(true); break;
+    case 'g': beginAim(); break;
     case 'z': r3d.turnView(-1); break;
     case 'x': r3d.turnView(1); break;
     case 'c': r3d.resetView(); break;
@@ -1072,8 +1115,11 @@ function showHowTo() {
     <ul>
       <li><b>1–6</b> pick a defense, click a tile to deploy (hold <b>Shift</b> to place several)</li>
       <li>Click a tower to inspect · <b>,</b> <b>.</b> <b>/</b> buy the next tier on paths 1–3 · <b>S</b> sell (70% refund) · <b>T</b> target mode</li>
+      <li><b>Manual aim</b> (<b>G</b>, or <b>T</b> round to AIM): a Plasma Mortar shells a ground spot you pick whenever an enemy is about to be in the blast; a Railgun holds a firing line and shoots whenever an enemy is on it — line one up along a straight road or sky lane</li>
+      <li><b>Sky lanes</b>: Hunter Drones leave the same gates but don't keep to the road: they cut straight across its corners (the dashed lines, brighter when drones are inbound), cruising over the low-rise blocks — only the tall towers hide them from your defenses. While placing or inspecting an anti-air tower, the stretch of lane it covers lights up</li>
       <li>Every tower has <b>3 upgrade paths × 5 tiers</b>. Crosspathing: you can invest in two paths, and only one may go past tier 2 (e.g. 5-2-0)</li>
       <li><b>Space</b> launch next wave — calling it early pays bonus credits</li>
+      <li><b>Loading</b>: towers only load while an enemy is in view, so each engagement opens with a load (a Railgun takes almost 3s, a Pulse Laser a quarter second). Slow weapons glow at the muzzle as the charge builds</li>
       <li><b>Buildings block line of sight</b>: lasers, tesla arcs, railgun slugs and cryo pulses can't reach what's behind them. While placing or inspecting a tower, its range area only covers the ground it can see. Plasma mortars lob over buildings; the Railgun's Thermal Scope punches through them</li>
       <li><b>Phantoms are always cloaked</b>: you need camo detection or a Netrunner Uplink field to hit them</li>
       <li><b>Q</b> EMP Burst · <b>W</b> Orbital Strike · <b>E</b> Overclock — cooldowns only recharge while a wave is running</li>
@@ -1089,7 +1135,7 @@ function showHowTo() {
     <p>Bosses have <b>skulls</b> on their health bar. At each one the hull locks for a moment and the boss triggers its protocol — the Titan vents an EMP that knocks out nearby towers, the Overmind hijacks your most valuable towers.</p>
     <h4>VARIANTS</h4>
     <ul>${Object.values(MODS).map((m) => `<li><b style="color:${m.color}">${m.name}</b> — ${m.desc}</li>`).join('')}</ul>
-    <p>Late campaign waves field the first three; in endless mode every wave rolls mutators from the whole list.</p>
+    <p>Late campaign waves field the first three (Mirror-Plated heavies most waves from 13 on, some also Warded), so mix your defenses; in endless mode every wave rolls mutators from the whole list.</p>
     <h4>DEFENSES</h4><div class="legend">${towerRows}</div>
     <h4>HOSTILES</h4><div class="legend">${enemyRows}</div>`,
   [{ label: 'GOT IT', primary: true, action: closeModal }]);

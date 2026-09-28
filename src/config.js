@@ -38,7 +38,7 @@ export const TOWERS = {
         tier('Twin Emitters', 205, 'Fires at 2 targets at once.', 'targets=2'),
         tier('Gatling Array', 430, '+60% fire rate, +30% damage.', 'rate*1.6', 'dmg*1.3'),
         tier('Quad Lattice', 1020, 'Fires at 4 targets, faster and harder.', 'targets=4', 'rate*1.25', 'dmg*1.4'),
-        tier('PHOTON STORM', 3430, 'Eight-barrel light storm that shreds entire waves.', 'targets=8', 'rate*1.8', 'dmg*2'),
+        tier('PHOTON STORM', 3430, 'Six-barrel light storm that shreds entire waves.', 'targets=6', 'rate*1.4', 'dmg*1.6'),
       ], true),
       path('FOCUS', '#ff9a3c', [
         tier('Focusing Lens', 110, '+45% damage.', 'dmg*1.45'),
@@ -87,7 +87,7 @@ export const TOWERS = {
   tesla: {
     name: 'TESLA COIL', color: '#ffe600', cost: 210, air: true, ground: true, size: 2,
     desc: 'Chain lightning arcs between targets. Deals triple damage to shields.',
-    base: { dmg: 25, rate: 1.1, range: 2.9, chains: 3, shieldMul: 3 },
+    base: { dmg: 32, rate: 1.1, range: 2.9, chains: 3, shieldMul: 3 },
     paths: [
       path('ARC', '#ffe600', [
         tier('Extra Coil', 160, '+1 chain.', 'chains+1'),
@@ -142,7 +142,7 @@ export const TOWERS = {
   },
   rail: {
     name: 'RAILGUN', color: '#ff3355', cost: 700, air: true, ground: true, size: 2,
-    desc: 'Hypersonic slug pierces every enemy in a line, losing 10% per enemy it passes through. Ignores armor.',
+    desc: 'Hypersonic slug pierces every enemy in a line, losing 10% per enemy it passes through. Ignores armor, but energy shields soak half of it.',
     base: { dmg: 150, rate: 0.36, range: 6.0 },
     paths: [
       path('CALIBER', '#ff3355', [
@@ -263,7 +263,7 @@ export const ENEMIES = {
   },
   drone: {
     name: 'HUNTER DRONE', hp: 28, speed: 1.9, reward: 5, lives: 2, radius: 0.32, color: '#00f0ff', flying: true,
-    desc: 'Fast and airborne. Plasma Mortars cannot hit it.',
+    desc: 'Fast and airborne: leaves the gate with the rest but cuts across the road\'s corners, over the low blocks. Plasma Mortars cannot hit it.',
   },
   brute: {
     name: 'HEAVY MECH', hp: 240, speed: 0.75, reward: 18, lives: 12, radius: 0.5, armor: 6, color: '#ff3355',
@@ -271,7 +271,7 @@ export const ENEMIES = {
   },
   aegis: {
     name: 'AEGIS UNIT', hp: 90, shield: 130, speed: 1.05, reward: 15, lives: 4, shieldLives: 4, radius: 0.42, color: '#3d8bff',
-    desc: 'Regenerating energy shield. Tesla Coils and EMP shred shields.',
+    desc: 'Regenerating energy shield. Tesla Coils and EMP shred shields; Railgun slugs do only half to them.',
   },
   phantom: {
     name: 'PHANTOM', hp: 75, speed: 1.6, reward: 13, lives: 4, radius: 0.33, color: '#a855ff', cloaked: true,
@@ -345,7 +345,7 @@ export const ABILITIES = {
 // Waypoints are tile coordinates; the first sits just off-map, the last is the data core.
 export const MAPS = [
   {
-    id: 'sector7', name: 'SECTOR 7', subtitle: 'Downtown Grid', diff: 0.55, credits: 380, lives: 100,
+    id: 'sector7', name: 'SECTOR 7', subtitle: 'Downtown Grid', diff: 0.52, credits: 380, lives: 100,
     theme: { path: '#ff2bd6', accent: '#00f0ff', ground: '#070512' },
     difficulty: 'STANDARD',
     paths: [
@@ -358,7 +358,7 @@ export const MAPS = [
     seed: 7,
   },
   {
-    id: 'docks', name: 'NEON DOCKS', subtitle: 'Harbor Freight Zone', diff: 0.555, credits: 430, lives: 100,
+    id: 'docks', name: 'NEON DOCKS', subtitle: 'Harbor Freight Zone', diff: 0.52, credits: 430, lives: 100,
     theme: { path: '#00f0ff', accent: '#ff8a00', ground: '#040912' },
     difficulty: 'HARD',
     paths: [
@@ -371,7 +371,7 @@ export const MAPS = [
     seed: 21,
   },
   {
-    id: 'nexus', name: 'CORE NEXUS', subtitle: 'Arcology Mainframe', diff: 0.47, credits: 500, lives: 100,
+    id: 'nexus', name: 'CORE NEXUS', subtitle: 'Arcology Mainframe', diff: 0.44, credits: 500, lives: 100,
     theme: { path: '#ffe600', accent: '#a855ff', ground: '#0a0510' },
     difficulty: 'EXTREME',
     paths: [
@@ -414,14 +414,14 @@ export const WAVES = [
   /* 10 */[g('runner', 16, 0.5), g('titan', 1, 1, 6), g('drone', 12, 0.6, 10)],
   /* 11 */[g('brute', 6, 2.2), g('jammer', 2, 5, 2), g('phantom', 10, 0.9, 4), g('medic', 3, 4, 6)],
   /* 12 */[g('drone', 20, 0.3), g('drone', 10, 0.45, 3, 'mirror'), g('aegis', 8, 1.2, 6), g('courier', 5, 1.2, 9)],
-  /* 13 */[g('splitter', 12, 1.1), g('medic', 4, 3, 4), g('brute', 4, 2.5, 8), g('jammer', 2, 4, 6)],
+  /* 13 */[g('splitter', 12, 1.1), g('medic', 4, 3, 4), g('brute', 4, 2.5, 8, 'mirror'), g('jammer', 2, 4, 6)],
   /* 14 */[g('phantom', 16, 0.7), g('aegis', 6, 1, 5), g('aegis', 4, 1.5, 7, 'insulated')],
-  /* 15 */[g('brute', 10, 1.6), g('medic', 5, 2.5, 3), g('drone', 20, 0.4, 6), g('courier', 6, 1, 8), g('jammer', 2, 4, 10)],
-  /* 16 */[g('runner', 24, 0.3), g('runner', 10, 0.5, 3, 'thermal'), g('splitter', 10, 1, 4), g('phantom', 10, 0.8, 8)],
-  /* 17 */[g('aegis', 16, 0.8), g('brute', 8, 1.5, 4, 'mirror'), g('medic', 5, 2.5, 6), g('courier', 8, 0.9, 8)],
-  /* 18 */[g('titan', 2, 10), g('drone', 25, 0.35, 3), g('phantom', 12, 0.7, 8), g('jammer', 3, 3, 5)],
-  /* 19 */[g('brute', 14, 1.1), g('aegis', 14, 0.9, 3, 'insulated'), g('splitter', 12, 0.9, 6, 'thermal'), g('medic', 6, 2, 5), g('courier', 8, 0.8, 9)],
-  /* 20 */[g('overmind', 1, 1, 4), g('runner', 20, 0.5), g('brute', 8, 2, 10), g('phantom', 12, 0.8, 14), g('jammer', 3, 4, 8)],
+  /* 15 */[g('brute', 10, 1.6, 0, 'mirror'), g('medic', 5, 2.5, 3), g('drone', 20, 0.4, 6), g('courier', 6, 1, 8), g('jammer', 2, 4, 10)],
+  /* 16 */[g('runner', 24, 0.3), g('runner', 10, 0.5, 3, 'thermal'), g('splitter', 10, 1, 4, 'mirror'), g('phantom', 10, 0.8, 8)],
+  /* 17 */[g('aegis', 16, 0.8), g('brute', 8, 1.5, 4, ['mirror', 'warded']), g('medic', 5, 2.5, 6), g('courier', 8, 0.9, 8)],
+  /* 18 */[g('titan', 2, 10), g('drone', 25, 0.35, 3), g('phantom', 12, 0.7, 8, 'mirror'), g('jammer', 3, 3, 5)],
+  /* 19 */[g('brute', 14, 1.1, 0, ['mirror', 'warded']), g('aegis', 14, 0.9, 3, 'insulated'), g('splitter', 12, 0.9, 6, 'thermal'), g('medic', 6, 2, 5), g('courier', 8, 0.8, 9)],
+  /* 20 */[g('overmind', 1, 1, 4), g('runner', 20, 0.5), g('brute', 8, 2, 10, 'mirror'), g('phantom', 12, 0.8, 14), g('jammer', 3, 4, 8)],
 ];
 
 const ENDLESS_POOL = ['runner', 'drone', 'brute', 'aegis', 'phantom', 'splitter', 'medic', 'jammer', 'courier'];
