@@ -352,7 +352,7 @@ kbd {
   80% { opacity: 1; }
   100% { opacity: 0; transform: translateY(-20px); }
 }
-.toasts { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; width: min(440px, 92%); }
+.toasts { position: absolute; top: 12px; transition: opacity 0.3s; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; width: min(440px, 92%); }
 .toast {
   background: rgba(8, 6, 20, 0.92);
   border: 1px solid var(--c, var(--cyan));
@@ -405,6 +405,96 @@ kbd {
 .legend { display: grid; grid-template-columns: 40px 1fr; gap: 6px 10px; align-items: center; }
 .legend img { width: 44px; height: 44px; object-fit: contain; }
 .legend b { color: var(--c, #fff); }
+
+
+/* ---------- Boss bars ---------- */
+.boss-bars { transition: opacity 0.3s; position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: min(520px, 70%); display: flex; flex-direction: column; gap: 6px; pointer-events: none; z-index: 1; }
+.boss-bar { background: rgba(8, 5, 18, 0.82); border: 1px solid color-mix(in srgb, var(--c) 60%, transparent); padding: 5px 8px 6px; box-shadow: 0 0 18px -6px var(--c); }
+.bb-head { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--font-display); font-size: 11px; letter-spacing: 0.18em; color: var(--c); margin-bottom: 4px; }
+.bb-head small { font-family: var(--font-mono); color: var(--dim); letter-spacing: 0.1em; }
+.bb-skulls { letter-spacing: 0.25em; }
+.bb-skulls .done { opacity: 0.25; }
+.bb-track { position: relative; height: 8px; background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.12); }
+.bb-fill { height: 100%; background: linear-gradient(90deg, var(--c), color-mix(in srgb, var(--c) 60%, #fff)); box-shadow: 0 0 10px var(--c); transition: width 0.15s; }
+.bb-fill.phase { background: #fff; box-shadow: 0 0 14px #fff; }
+.bb-track i { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fff; box-shadow: 0 0 6px #fff; }
+.bb-track i.done { opacity: 0.2; box-shadow: none; }
+.bb-shield { height: 3px; margin-top: 2px; background: rgba(255, 255, 255, 0.05); }
+.bb-shield div { height: 100%; background: #5aa0ff; box-shadow: 0 0 6px #5aa0ff; transition: width 0.15s; }
+.canvas-wrap:has(.boss-bar) .toasts { top: 74px; }
+
+/* ---------- Handler comms (voice subtitles) ---------- */
+.comms { position: absolute; left: 14px; bottom: 30px; max-width: min(460px, 60%); background: rgba(6, 4, 16, 0.86); border: 1px solid rgba(255, 176, 0, 0.45); border-left: 3px solid #ffb000; padding: 7px 12px; font-size: 13px; line-height: 1.35; color: #f3e6c8; pointer-events: none; opacity: 0; transform: translateY(8px); transition: opacity 0.25s, transform 0.25s; z-index: 2; }
+.comms.show { opacity: 1; transform: none; }
+.comms-tag { display: block; font-family: var(--font-display); font-size: 9px; letter-spacing: 0.3em; color: #ffb000; margin-bottom: 2px; }
+.comms-tag::first-letter { animation: blink 0.8s infinite; }
+
+/* ---------- Boss intro ---------- */
+.cine { position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity 0.3s; z-index: 3; }
+.cine.show { opacity: 1; pointer-events: auto; cursor: pointer; }
+.cine-bar { position: absolute; left: 0; right: 0; height: 0; background: #000; transition: height 0.45s ease-out; }
+.cine-bar.top { top: 0; }
+.cine-bar.bottom { bottom: 0; }
+.cine.show .cine-bar { height: 11%; }
+.cine-card { position: absolute; left: 6%; bottom: 16%; max-width: 440px; text-shadow: 0 2px 10px #000; }
+.cc-kicker { font-size: 11px; letter-spacing: 0.4em; color: var(--red); }
+.cc-name { font-family: var(--font-display); font-weight: 900; font-size: clamp(26px, 4.5vw, 52px); letter-spacing: 0.12em; color: var(--c, var(--magenta)); text-shadow: 0 0 18px var(--c, var(--magenta)), 0 2px 8px #000; line-height: 1.05; margin: 4px 0; }
+.cc-desc { color: #d6e2f3; font-size: 14px; line-height: 1.4; }
+.cc-phase { margin-top: 6px; font-size: 12px; color: #fff; letter-spacing: 0.08em; }
+.cc-phase b { color: var(--c, var(--magenta)); font-weight: normal; letter-spacing: 0.2em; }
+.cine.show .cine-card { animation: cine-in 0.6s ease-out both 0.2s; }
+@keyframes cine-in { from { opacity: 0; transform: translateX(-30px); filter: blur(6px); } }
+.cine-skip { position: absolute; right: 16px; bottom: calc(11% + 8px); font-size: 10px; letter-spacing: 0.3em; color: var(--dim); }
+/* During an intro: toasts and boss bars step aside, the handler's line becomes a subtitle in the bottom bar. */
+.canvas-wrap:has(.cine.show) .toasts, .canvas-wrap:has(.cine.show) .boss-bars { opacity: 0; }
+.canvas-wrap:has(.cine.show) .comms { left: 50%; right: auto; bottom: 2.2%; max-width: 70%; transform: translateX(-50%); background: none; border: 0; text-align: center; z-index: 4; font-size: 15px; color: #fff; text-shadow: 0 1px 4px #000; }
+.canvas-wrap:has(.cine.show) .comms-tag { display: none; }
+
+/* ---------- Tower veterancy / combos / heat ---------- */
+.rank-row { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; font-size: 10px; letter-spacing: 0.12em; color: var(--yellow); margin: 4px 0 2px; }
+.rank-row .chev { letter-spacing: -0.1em; text-shadow: 0 0 6px var(--yellow); }
+.rank-row .xpbar { height: 4px; background: rgba(255, 255, 255, 0.08); }
+.rank-row .xpbar div { height: 100%; background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+.rank-row small { color: var(--dim); letter-spacing: 0.05em; }
+.combo-chips { display: flex; flex-wrap: wrap; gap: 3px; margin: 0 0 6px; }
+.combo-chip { font-size: 9px; letter-spacing: 0.08em; border: 1px dashed var(--rc); color: var(--rc); padding: 0 4px; cursor: help; }
+.heat-line { font-size: 11px; color: var(--dim); margin-top: 6px; letter-spacing: 0.05em; }
+.heat-line b { font-weight: normal; }
+.fresh { color: var(--green); font-size: 9px; letter-spacing: 0.1em; }
+.tag.mod { border-style: dashed; }
+.variant-line { font-size: 11px; color: #b6c5dd; margin: 2px 0; }
+.variant-line b { color: var(--vc); font-weight: normal; letter-spacing: 0.08em; }
+.nw-item { position: relative; }
+.nw-item .mods { display: flex; flex-direction: column; gap: 1px; margin-left: 3px; }
+.nw-item .mod { font-size: 8px; letter-spacing: 0.06em; color: var(--vc); border: 1px solid var(--vc); padding: 0 2px; line-height: 1.2; }
+.nw-mutators { width: 100%; font-size: 10px; letter-spacing: 0.12em; color: var(--dim); }
+.nw-mutators b { font-weight: normal; }
+#btn-auto.on { background: var(--green); color: #000; border-color: var(--green); }
+#btn-auto .cnt { margin-left: 4px; }
+
+/* ---------- Settings ---------- */
+.set-group { margin: 6px 0 14px; }
+.set-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 13px; }
+.set-row small { display: block; color: var(--dim); font-size: 11px; }
+.seg { display: flex; gap: 2px; }
+.seg button { background: rgba(0, 240, 255, 0.05); border: 1px solid rgba(0, 240, 255, 0.35); color: var(--cyan); padding: 4px 10px; font-family: var(--font-display); font-size: 10px; letter-spacing: 0.1em; cursor: pointer; }
+.seg button.on { background: var(--cyan); color: #000; }
+
+/* ---------- End-of-run report ---------- */
+.report { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 10px; }
+.rep-row { display: grid; grid-template-columns: 34px minmax(130px, 1fr) 1fr 84px; gap: 8px; align-items: center; font-size: 12px; }
+.rep-row img { width: 32px; height: 32px; object-fit: contain; }
+.rep-name { line-height: 1.15; color: var(--c); font-size: 12px; }
+.rep-name small { display: block; color: var(--dim); font-size: 10px; letter-spacing: 0.05em; }
+.rep-name .mvp { color: var(--yellow); font-size: 9px; letter-spacing: 0.2em; border: 1px solid var(--yellow); padding: 0 3px; margin-left: 4px; }
+.rep-bar { height: 6px; background: rgba(255, 255, 255, 0.07); }
+.rep-bar i { display: block; height: 100%; background: var(--c); box-shadow: 0 0 6px var(--c); }
+.rep-row b { font-family: var(--font-display); font-size: 12px; color: #fff; text-align: right; font-weight: 700; }
+.rep-row b small { display: block; font-family: var(--font-mono); font-weight: normal; font-size: 10px; color: var(--dim); }
+.rep-row.sold { opacity: 0.6; }
+.rep-sum { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--dim); margin: 4px 0; }
+.rep-sum span b { font-weight: normal; }
+.crt.off { display: none; }
 
 @media (max-width: 900px) and (orientation: portrait) {
   .game-main { flex-direction: column; }

@@ -60,6 +60,30 @@ def split_mesh(o, z_cut):
     return o, head
 
 
+def split_barrels(head, cut_y):
+    """Split a rotary barrel cluster (everything in front of y = cut_y) off the head into a child 'barrels' whose
+    origin sits on the cluster's own axis, so the game can spin it (a gatling's barrels, not the whole turret)."""
+    V = np.array([tuple(v.co) for v in head.data.vertices])  # head-local (its world matrix isn't refreshed yet)
+    front = V[V[:, 1] < cut_y]
+    ax = (front[:, 0].min() + front[:, 0].max()) / 2
+    az = (front[:, 2].min() + front[:, 2].max()) / 2
+    bar = head.copy(); bar.data = head.data.copy(); bpy.context.scene.collection.objects.link(bar)
+    for obj, keep_front in ((head, False), (bar, True)):
+        bm = bmesh.new(); bm.from_mesh(obj.data)
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        # Plane normal +Y: "outer" is behind the cut (toward the housing), "inner" is the barrels' side.
+        bmesh.ops.bisect_plane(bm, geom=geom, plane_co=(0, cut_y, 0), plane_no=(0, 1, 0),
+                               clear_inner=not keep_front, clear_outer=keep_front)
+        bm.to_mesh(obj.data); bm.free(); obj.data.update()
+    apply_matrix(bar, Matrix.Translation((-ax, 0, -az)))
+    bar.name = 'barrels'
+    bar.parent = head
+    bar.matrix_parent_inverse = Matrix.Identity(4)
+    bar.location = (ax, 0, az)
+    print(f'   barrels split at y={cut_y:.3f}, axis x={ax:.3f} z={az:.3f} (head-local), {len(bar.data.polygons)} faces')
+    return bar
+
+
 def build_emission(mat, em):
     """Derive an emissive texture from saturated, bright pixels near the accent hue(s)."""
     nt = mat.node_tree
@@ -172,7 +196,9 @@ def process(name, a):
                 V = world_verts(o)
                 print(f'   auto-yaw {math.degrees(-math.pi / 2 - ang):.0f} deg')
             print(f'   split at {frac:.2f} of height (z={z_cut:.3f})')
-            split_mesh(o, z_cut)
+            base, head = split_mesh(o, z_cut)
+            if a.get('barrels'):
+                split_barrels(head, a['barrels']['cut_y'])
         else:
             o.name = 'body'
     for mat in bpy.data.materials:

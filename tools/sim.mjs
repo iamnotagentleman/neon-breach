@@ -1,5 +1,6 @@
 // Headless balance check: a scripted "reasonable player" plays every map.
 // Usage: node tools/sim.mjs [runs=3] [skill=1]   (skill < 1 = sloppier player that spends less)
+// STATS=1 prints couriers, tower ranks and combo counts per run; VERBOSE=1 a per-wave log.
 import { Game } from '../src/game.js';
 import { MAPS, TOWERS, TILE, COLS, ROWS, ABILITIES } from '../src/config.js';
 
@@ -115,7 +116,10 @@ function play(mapIndex) {
     useAbilities(game);
     t += dt;
   }
-  return { map: MAPS[mapIndex].name, result: game.state, wave: game.wave, lives: game.lives, towers: game.towers.length, credits: Math.floor(game.credits), time: Math.round(t), log };
+  const ranks = game.towers.map((tw) => tw.rank).sort().join('');
+  const gs = game.stats;
+  const extra = `stolen=${gs.stolen} escaped=${gs.escaped} recovered=${gs.recovered} ranks=${ranks} combos=${JSON.stringify(gs.reactions)}`;
+  return { map: MAPS[mapIndex].name, result: game.state, wave: game.wave, lives: game.lives, towers: game.towers.length, credits: Math.floor(game.credits), time: Math.round(t), log, extra };
 }
 
 const only = process.env.MAP != null ? [Number(process.env.MAP)] : MAPS.map((_, i) => i);
@@ -125,4 +129,5 @@ for (const m of only) {
   const s = results.map((r) => `${r.result === 'won' ? 'WIN ' : 'LOSS'} w${r.wave} lives=${r.lives} towers=${r.towers} ¢=${r.credits} ${r.time}s`).join(' | ');
   console.log(`${MAPS[m].name.padEnd(12)} ${s}`);
   if (process.env.VERBOSE) console.log(results[0].log.map((l) => `w${l.wave}:L${l.lives}/$${l.credits}/T${l.towers}`).join(' '));
+  if (process.env.STATS) for (const r of results) console.log(`   ${r.extra}`);
 }

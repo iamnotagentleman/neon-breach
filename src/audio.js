@@ -2,6 +2,7 @@
 // SFX: ElevenLabs-generated samples (several variations for rapid-fire sounds), trimmed and
 // loudness-normalized at load. Procedural Web Audio synthesis remains as a fallback per sound.
 import { W } from './config.js';
+import { VOICE_LINES } from './voice.js';
 
 const TRACKS = {
   menu: { file: 'assets/audio/music_menu.mp3', loopStart: 10.4, loopEnd: 53.2, xfade: 2.0 },
@@ -14,6 +15,8 @@ const TRACKS = {
 //   throttle: min seconds between plays        poly: max simultaneous copies   jitter: +- playback rate
 const SFX = {
   laser: { key: 'laser', n: 3, gain: 0.22, maxDur: 0.35, throttle: 0.06, poly: 5, jitter: 0.06 },
+  // Photon Storm's rotary cannon: the laser shot, pitched down and clipped short so it rattles like a gatling.
+  gatling: { key: 'laser', n: 3, gain: 0.2, maxDur: 0.09, throttle: 0.035, poly: 6, jitter: 0.1, rate: 0.72 },
   plasma: { key: 'plasma_launch', n: 2, gain: 0.4, maxDur: 0.7, throttle: 0.08, poly: 3, jitter: 0.05 },
   plasmahit: { key: 'plasma_hit', n: 2, gain: 0.42, maxDur: 1.0, throttle: 0.08, poly: 3, jitter: 0.06 },
   tesla: { key: 'tesla', n: 3, gain: 0.3, maxDur: 0.5, throttle: 0.07, poly: 4, jitter: 0.06 },
@@ -58,7 +61,9 @@ export class AudioManager {
     this.active = {};
     this.bank = {};
     this.voices = 0;
-    this.settings = { music: 0.55, sfx: 0.7, muted: false };
+    this.voice = { buffers: {}, current: null, queue: [], last: {} };
+    this.onLine = null; // (key, text, seconds) => void: subtitle hook, called even when muted
+    this.settings = { music: 0.55, sfx: 0.7, voice: 0.9, muted: false };
     try { Object.assign(this.settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch { /* ignore */ }
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
@@ -77,6 +82,21 @@ export class AudioManager {
     this.weaponBus = this.ctx.createGain();
     this.weaponBus.gain.value = 2.6;
     this.weaponBus.connect(this.sfxBus);
+    // Handler voice over a comms channel: band-limited, lightly driven, compressed.
+    this.voiceBus = this.ctx.createGain();
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 260;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 4200;
+    const drive = this.ctx.createWaveShaper();
+    const curve = new Float32Array(1024);
+    for (let i = 0; i < 1024; i++) { const x = i / 511.5 - 1; curve[i] = Math.tanh(x * 1.8) / Math.tanh(1.8); }
+    drive.curve = curve;
+    const vcomp = this.ctx.createDynamicsCompressor();
+    vcomp.threshold.value = -18; vcomp.ratio.value = 4;
+    this.voiceIn = this.ctx.createGain();
+    this.voiceIn.connect(hp).connect(lp).connect(drive).connect(vcomp).connect(this.voiceBus);
+    this.voiceBus.connect(this.master);
     this.applyVolumes();
     const len = this.ctx.sampleRate;
     this.noise = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
@@ -107,6 +127,7 @@ export class AudioManager {
     for (const spec of Object.values(SFX)) for (let i = 1; i <= spec.n; i++) sfxJobs.push(loadSfx(spec.key, i));
     await Promise.all([...Object.entries(TRACKS).map(([k, t]) => load(k, t.file)), ...sfxJobs]);
     if (this.wanted && !this.current) this.playMusic(this.wanted);
+    this.loadVoice();
   }
 
   // Peak-normalize and skip leading silence so every variation hits at the same moment and level.
@@ -130,12 +151,90 @@ export class AudioManager {
     if (!this.ctx) return;
     const m = this.settings.muted ? 0 : 1;
     const now = this.ctx.currentTime;
-    this.musicBus.gain.setTargetAtTime(this.settings.music * 0.6 * m, now, 0.05);
+    const duck = this.voice?.current?.src ? 0.45 : 1; // music dips under the handler's voice
+    this.musicBus.gain.setTargetAtTime(this.settings.music * 0.6 * m * duck, now, duck < 1 ? 0.08 : 0.4);
     this.sfxBus.gain.setTargetAtTime(this.settings.sfx * m, now, 0.05);
+    this.voiceBus?.gain.setTargetAtTime(this.settings.voice * 1.4 * m, now, 0.05);
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings)); } catch { /* ignore */ }
   }
 
   set(key, value) { this.settings[key] = value; this.applyVolumes(); }
+
+  // ---------- Handler voice ----------
+  async loadVoice() {
+    if (!this.ctx) return;
+    await Promise.all(Object.keys(VOICE_LINES).map(async (key) => {
+      try {
+        const res = await fetch(`assets/audio/voice/${key}.mp3`);
+        if (!res.ok) throw new Error(res.status);
+        this.voice.buffers[key] = await this.ctx.decodeAudioData(await res.arrayBuffer());
+      } catch { /* no clip: the subtitle still shows */ }
+    }));
+  }
+
+  // Queue a handler line. Higher priority interrupts; otherwise it waits (two at most) or is dropped.
+  say(key) {
+    const line = VOICE_LINES[key];
+    if (!line) return;
+    const now = performance.now() / 1000;
+    const vs = this.voice;
+    if (line.cd && now - (vs.last[key] ?? -1e9) < line.cd) return;
+    const cur = vs.current;
+    if (cur && cur.key === key) return;
+    if (!cur) this.startLine(key);
+    else if ((line.pri || 0) > cur.pri) { this.stopLine(); this.startLine(key); }
+    else if (vs.queue.length < 2 && !vs.queue.includes(key)) {
+      vs.queue.push(key);
+      vs.queue.sort((a, b) => (VOICE_LINES[b].pri || 0) - (VOICE_LINES[a].pri || 0));
+    }
+  }
+
+  startLine(key) {
+    const line = VOICE_LINES[key];
+    const vs = this.voice;
+    vs.last[key] = performance.now() / 1000;
+    const buf = vs.buffers[key];
+    const dur = buf ? buf.duration : 1 + line.text.length * 0.06;
+    const cur = { key, pri: line.pri || 0, src: null, timer: null };
+    vs.current = cur;
+    const audible = buf && this.ctx && this.ctx.state === 'running' && !this.settings.muted;
+    if (audible) {
+      const t = this.ctx.currentTime + 0.08;
+      // Squelch clicks at the start and end of the transmission.
+      this.noiseSrc(this.env(this.voiceIn, this.ctx.currentTime, 0.002, 0.06, 0.05), this.ctx.currentTime, 0.07, 'bandpass', 2500, 1800, 2);
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(this.voiceIn);
+      src.start(t);
+      cur.src = src;
+      this.noiseSrc(this.env(this.voiceIn, t + dur, 0.002, 0.08, 0.04), t + dur, 0.09, 'bandpass', 2200, 1500, 2);
+      this.applyVolumes();
+    }
+    this.onLine?.(key, line.text, dur + 0.3);
+    cur.timer = setTimeout(() => { if (vs.current === cur) this.nextLine(); }, (dur + 0.35) * 1000);
+  }
+
+  stopLine() {
+    const cur = this.voice.current;
+    if (!cur) return;
+    clearTimeout(cur.timer);
+    try { cur.src?.stop(); } catch { /* not started */ }
+    this.voice.current = null;
+  }
+
+  nextLine() {
+    this.voice.current = null;
+    this.applyVolumes();
+    const next = this.voice.queue.shift();
+    if (next) this.startLine(next);
+  }
+
+  // Drop anything pending (leaving a match, restarting).
+  clearVoice() {
+    this.voice.queue = [];
+    this.stopLine();
+    this.applyVolumes();
+  }
 
   // ---------- Music ----------
   playMusic(name) {
@@ -274,7 +373,7 @@ export class AudioManager {
     const t = this.ctx.currentTime + 0.005;
     const s = this.ctx.createBufferSource();
     s.buffer = v.buf;
-    s.playbackRate.value = 1 + (Math.random() * 2 - 1) * (spec.jitter || 0);
+    s.playbackRate.value = (spec.rate || 1) + (Math.random() * 2 - 1) * (spec.jitter || 0);
     const g = this.ctx.createGain();
     g.gain.value = v.norm * spec.gain;
     s.connect(g).connect(this.pan(src?.x));

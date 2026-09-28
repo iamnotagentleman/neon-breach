@@ -23,12 +23,12 @@
       <nav class="menu">
         <button class="btn btn-primary" data-action="play"><span>JACK IN</span></button>
         <button class="btn" data-action="howto"><span>HOW TO PLAY</span></button>
-        <button class="btn" data-action="audio"><span>AUDIO</span></button>
+        <button class="btn" data-action="settings"><span>SETTINGS</span></button>
       </nav>
       <div class="hint" id="audio-hint">▶ CLICK ANYWHERE TO BOOT AUDIO SUBSYSTEM</div>
       <div class="loadbar" id="loadbar"><div class="loadbar-fill" id="loadbar-fill"></div><span id="loadbar-text">LOADING 3D ASSETS 0%</span></div>
     </div>
-    <footer class="credits">SOUNDTRACK &amp; SFX GENERATED WITH <b>ELEVENLABS</b> MUSIC · SOUND EFFECTS</footer>
+    <footer class="credits">SOUNDTRACK, SFX &amp; VOICE GENERATED WITH <b>ELEVENLABS</b> MUSIC · SOUND EFFECTS · TEXT TO SPEECH</footer>
   </section>
 
   <!-- LEVEL SELECT -->
@@ -66,7 +66,10 @@
         <button class="btn-icon speed active" data-speed="1">1×</button>
         <button class="btn-icon speed" data-speed="2">2×</button>
         <button class="btn-icon speed" data-speed="3">3×</button>
+        <button class="btn-icon speed" data-speed="4">4×</button>
       </div>
+      <button class="btn-icon" id="btn-auto" title="Auto-launch the next wave (A)">AUTO</button>
+      <button class="btn-icon" id="btn-settings" title="Settings">⚙</button>
       <button class="btn-icon" id="btn-mute" title="Mute (M)">♪</button>
       <button class="btn-icon" id="btn-pause" title="Pause (P)">❚❚</button>
     </header>
@@ -77,8 +80,15 @@
         <canvas id="overlay"></canvas>
         <div class="crt"></div>
         <div class="cam-hint">RMB DRAG · PAN &nbsp;·&nbsp; WHEEL · ZOOM &nbsp;·&nbsp; MMB · Z X · TURN &nbsp;·&nbsp; C · RESET</div>
+        <div id="boss-bars" class="boss-bars"></div>
         <div id="banner" class="banner"></div>
         <div id="toasts" class="toasts"></div>
+        <div id="comms" class="comms"><span class="comms-tag">◉ HANDLER</span><span id="comms-text"></span></div>
+        <div id="cine" class="cine">
+          <div class="cine-bar top"></div><div class="cine-bar bottom"></div>
+          <div class="cine-card"><div class="cc-kicker">⚠ BOSS SIGNATURE</div><div class="cc-name" id="cc-name"></div><div class="cc-desc" id="cc-desc"></div><div class="cc-phase" id="cc-phase"></div></div>
+          <div class="cine-skip">CLICK · SPACE · ESC TO SKIP</div>
+        </div>
       </div>
 
       <aside class="sidebar">

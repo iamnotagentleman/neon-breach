@@ -1,6 +1,6 @@
 // Pure simulation: no DOM, no audio. Renderer and UI read state; side effects go through `hooks`.
 import {
-  TILE, COLS, ROWS, TOWERS, ENEMIES, MAPS, WAVES, ABILITIES,
+  TILE, COLS, ROWS, TOWERS, ENEMIES, MAPS, WAVES, ABILITIES, MODS, VET, REACTIONS,
   hpMultiplier, waveBonus, earlyBonus, SELL_RATIO, endlessWave, computeStats, canUpgradePath,
 } from './config.js';
 
@@ -53,6 +53,16 @@ export function pathTiles(waypoints) {
     }
   }
   return out;
+}
+
+// Position and heading at distance `dist` along a built path, searching from segment hint `seg`.
+export function pathPoint(p, dist, seg = 0) {
+  while (seg < p.pts.length - 2 && dist > p.cum[seg + 1]) seg++;
+  while (seg > 0 && dist < p.cum[seg]) seg--;
+  const a = p.pts[seg], b = p.pts[seg + 1];
+  const segLen = p.cum[seg + 1] - p.cum[seg];
+  const t = Math.min(1, Math.max(0, (dist - p.cum[seg]) / segLen));
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, dx: (b.x - a.x) / segLen, dy: (b.y - a.y) / segLen, seg };
 }
 
 export function seededRandom(seed) {
@@ -140,32 +150,81 @@ export function segmentBlock(rects, x0, y0, x1, y1) {
   return best;
 }
 
+// Placement heat map: for every tile, how many tiles of road a `type` tower anchored there would cover (only road it
+// can see, unless it fires over buildings), or -1 where it can't be built. Uplinks score the towers they'd buff.
+export function coverageMap(game, type) {
+  const def = TOWERS[type], size = def.size || 1;
+  const r = def.base.range * TILE;
+  const walls = type !== 'plasma' && type !== 'uplink';
+  const STEP = 8;
+  if (!game.roadSamples) {
+    game.roadSamples = [];
+    for (const p of game.paths) {
+      for (let d = 0; d < p.length; d += STEP) {
+        const q = pathPoint(p, d);
+        if (q.x >= 0 && q.y >= 0 && q.x <= COLS * TILE && q.y <= ROWS * TILE) game.roadSamples.push(q);
+      }
+    }
+  }
+  const out = new Float32Array(COLS * ROWS).fill(-1);
+  for (let ty = 0; ty < ROWS; ty++) {
+    for (let tx = 0; tx < COLS; tx++) {
+      if (!game.canPlace(tx, ty, size)) continue;
+      const x = (tx + size / 2) * TILE, y = (ty + size / 2) * TILE;
+      let v = 0;
+      if (type === 'uplink') {
+        for (const t of game.towers) {
+          if (t.type !== 'uplink' && (t.x - x) ** 2 + (t.y - y) ** 2 <= (r + TILE * t.size * 0.5) ** 2) v += 1 + t.level;
+        }
+      } else {
+        for (const q of game.roadSamples) {
+          if ((q.x - x) ** 2 + (q.y - y) ** 2 <= r * r && (!walls || game.los(x, y, q.x, q.y))) v += STEP / TILE;
+        }
+      }
+      out[ty * COLS + tx] = v;
+    }
+  }
+  return out;
+}
+
 // Core damage of a breach: the hull's hit, plus the shield as an extra layer (in proportion to how much of it is
 // still up), plus the children a Replicator would have spawned.
 export function coreDamage(e) {
   const d = e.def;
+  if (d.courier) return d.courier.packet; // lost only if it escapes with a packet
   let dmg = d.lives;
-  if (d.shieldLives && e.maxShield > 0) dmg += Math.ceil(d.shieldLives * (e.shield / e.maxShield));
+  if (e.shieldLives && e.maxShield > 0) dmg += Math.ceil(e.shieldLives * (e.shield / e.maxShield));
   if (d.splits) dmg += d.splits.count * ENEMIES[d.splits.type].lives;
   return dmg;
 }
 
 export class Enemy {
-  constructor(game, type, pathIdx, waveId, startDist = 0) {
+  constructor(game, type, pathIdx, waveId, startDist = 0, mods = null) {
     const def = ENEMIES[type];
     const mul = hpMultiplier(waveId) * game.map.diff;
     this.id = nextId++;
     this.type = type;
     this.def = def;
     this.waveId = waveId;
-    this.maxHp = def.hp * mul;
+    // Variants (config MODS): resistances and endless mutators. Bosses never carry them.
+    this.mods = def.boss || !mods ? [] : mods.filter((m) => MODS[m]);
+    const has = (m) => this.mods.includes(m);
+    this.maxHp = def.hp * mul * (has('hardened') ? 1.5 : 1);
     this.hp = this.maxHp;
     this.maxShield = (def.shield || 0) * mul;
+    this.shieldLives = def.shieldLives || 0;
+    if (has('warded') && !this.maxShield) { this.maxShield = this.maxHp * 0.5; this.shieldLives = 2; }
     this.shield = this.maxShield;
-    this.armor = def.armor || 0;
+    this.armor = (def.armor || 0) + (has('hardened') ? 3 : 0);
+    this.speedMul = has('amped') ? 1.3 : 1;
+    this.regen = has('repair') ? 0.04 : 0;
+    this.mirror = has('mirror');
+    this.insulated = has('insulated');
+    this.thermal = has('thermal');
+    this.cloaked = !!def.cloaked || has('ghosted');
     this.radius = def.radius * TILE;
     this.flying = !!def.flying;
-    this.reward = Math.round(def.reward * 1.3 * (1 + 0.04 * (waveId - 1)));
+    this.reward = Math.round(def.reward * 1.3 * (1 + 0.04 * (waveId - 1)) * (1 + 0.2 * this.mods.length));
     this.healRate = def.heal ? def.heal.rate * mul : 0;
     this.pathIdx = pathIdx;
     this.path = game.paths[pathIdx];
@@ -179,8 +238,14 @@ export class Enemy {
     this.frozenT = 0;
     this.lastHit = -99;
     this.flash = 0;
-    this.revealed = !def.cloaked;
-    this.spawnT = def.spawns ? def.spawns.every : 0;
+    this.revealed = !this.cloaked;
+    this.spawnEvery = def.spawns ? def.spawns.every : 0;
+    this.spawnT = this.spawnEvery;
+    this.dir = 1; // -1: a Data Courier running back out with a packet
+    this.carrying = false;
+    this.phase = 0; // boss skulls passed
+    this.phaseT = 0; // boss phase transition: untouchable
+    this.surgeT = 0;
     this.dead = false;
     this.leaked = false;
     this.anim = Math.random() * 10;
@@ -191,12 +256,18 @@ export class Enemy {
     this.brittle = 0; this.brittleT = 0;
     this.shatter = 0; this.shatterT = 0; this.shatterSrc = null;
     this.auraSlow = 0; this.auraAmp = 0; this.auraArmorDown = 0;
+    this.crackT = 0; // Thermal Shock: armor cracked open
+    this.reactT = 0; // per-enemy combo cooldown
     this.updatePos();
   }
 
-  get remaining() { return this.path.length - this.dist; }
+  // Distance left to where this enemy does damage: the core, or the exit for a courier carrying a packet.
+  get remaining() { return this.dir > 0 ? this.path.length - this.dist : this.dist; }
+  get effArmor() { return this.crackT > 0 ? 0 : Math.max(0, this.armor - this.shred - this.auraArmorDown); }
+  get stripped() { return this.shred > 0 || this.auraArmorDown > 0 || this.crackT > 0; }
 
   applySlow(amount, dur, full = false) {
+    if (this.thermal) return;
     this.slowAmt = Math.max(this.slowT > 0 ? this.slowAmt : 0, amount);
     this.slowT = Math.max(this.slowT, dur);
     if (full) this.slowFull = true;
@@ -208,20 +279,17 @@ export class Enemy {
   }
 
   updatePos() {
-    const p = this.path;
-    while (this.seg < p.pts.length - 2 && this.dist > p.cum[this.seg + 1]) this.seg++;
-    const a = p.pts[this.seg], b = p.pts[this.seg + 1];
-    const segLen = p.cum[this.seg + 1] - p.cum[this.seg];
-    const t = Math.min(1, Math.max(0, (this.dist - p.cum[this.seg]) / segLen));
-    const dx = (b.x - a.x) / segLen, dy = (b.y - a.y) / segLen;
-    this.x = a.x + (b.x - a.x) * t - dy * this.offset;
-    this.y = a.y + (b.y - a.y) * t + dx * this.offset;
-    this.angle = Math.atan2(dy, dx);
+    const q = pathPoint(this.path, this.dist, this.seg);
+    this.seg = q.seg;
+    this.x = q.x - q.dy * this.offset;
+    this.y = q.y + q.dx * this.offset;
+    this.angle = Math.atan2(q.dy, q.dx) + (this.dir < 0 ? Math.PI : 0);
   }
 
+  // Knockback always pushes away from where the enemy is heading.
   knockBack(px) {
-    this.dist = Math.max(0, this.dist - (this.def.boss ? px * 0.3 : px));
-    this.seg = 0;
+    const d = this.def.boss ? px * 0.3 : px;
+    this.dist = this.dir > 0 ? Math.max(0, this.dist - d) : Math.min(this.path.length - 1, this.dist + d);
     this.updatePos();
   }
 
@@ -232,6 +300,11 @@ export class Enemy {
     this.brittleT = Math.max(0, this.brittleT - dt);
     this.shatterT = Math.max(0, this.shatterT - dt);
     this.frozenT = Math.max(0, this.frozenT - dt);
+    this.crackT = Math.max(0, this.crackT - dt);
+    this.reactT = Math.max(0, this.reactT - dt);
+    this.phaseT = Math.max(0, this.phaseT - dt);
+    this.surgeT = Math.max(0, this.surgeT - dt);
+    if (this.regen && game.time - this.lastHit > 1.5 && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * this.regen * dt);
     if (this.burnT > 0) {
       this.burnT -= dt;
       game.damage(this, this.burnDps * dt, { tower: this.burnSrc, pierce: true, quiet: true });
@@ -241,8 +314,7 @@ export class Enemy {
     if (this.slowT > 0) this.slowT -= dt;
     const boss = this.def.boss;
     const slow = Math.max(this.slowT > 0 ? this.slowAmt * (boss && !this.slowFull ? 0.5 : 1) : 0, this.auraSlow * (boss ? 0.5 : 1));
-    const speed = this.def.speed * (1 - Math.min(0.85, slow));
-    this.dist += speed * TILE * dt;
+    this.dist += this.dir * this.speed * (1 - Math.min(0.85, slow)) * TILE * dt;
     this.updatePos();
 
     if (this.maxShield > 0 && game.time - this.lastHit > 2 && this.shield < this.maxShield) {
@@ -259,14 +331,22 @@ export class Enemy {
     if (this.def.spawns) {
       this.spawnT -= dt;
       if (this.spawnT <= 0) {
-        this.spawnT = this.def.spawns.every;
+        this.spawnT = this.spawnEvery;
         for (let i = 0; i < this.def.spawns.count; i++) {
           game.spawnEnemy(this.def.spawns.type, this.pathIdx, this.waveId, Math.max(0, this.dist - i * 14));
         }
         game.fx.ring(this.x, this.y, 10, 60, this.def.color, 0.5);
       }
     }
-    if (this.dist >= this.path.length) game.leak(this);
+    if (this.dir < 0) { if (this.dist <= 0) game.escape(this); }
+    else if (this.dist >= this.path.length) {
+      if (this.def.courier) game.steal(this); else game.leak(this);
+    }
+  }
+
+  // Base speed with variants, boss surges and a courier's packet weighing it down (tiles/s, before slows).
+  get speed() {
+    return this.def.speed * this.speedMul * (this.surgeT > 0 ? 1.6 : 1) * (this.carrying ? this.def.courier.carrySpeed : 1);
   }
 }
 
@@ -294,14 +374,20 @@ export class Tower {
     this.built = 0;
     this.shots = 0;
     this.pulses = 0;
+    this.xp = 0;
+    this.rank = 0;
+    this.jamT = 0; // knocked offline (Signal Jammer field, Titan EMP, Overmind hijack)
+    this.jamKind = null;
+    this.buffSrc = null; // the Uplink whose buff this tower is getting
+    this.fresh = false; // bought during the current build phase: sells for a full refund
     this.refresh();
   }
 
-  refresh() { this.stats = computeStats(this.def, this.tiers); }
+  refresh() { this.stats = computeStats(this.def, this.tiers, this.rank); }
   // Highest tier on any path (0-5): drives visual intensity.
   get level() { return Math.max(...this.tiers); }
   get range() { return (this.stats.global ? 40 : this.stats.range) * TILE; }
-  get sellValue() { return Math.floor(this.invested * SELL_RATIO); }
+  get sellValue() { return this.fresh ? this.invested : Math.floor(this.invested * SELL_RATIO); }
   get mainPath() {
     const m = Math.max(...this.tiers);
     return m ? this.tiers.indexOf(m) : -1;
@@ -362,10 +448,15 @@ export class Tower {
     if (e.def.boss) amount *= s.bossMul;
     game.damage(e, amount, { tower: this, ...opts });
     if (e.dead) return;
-    if (s.burn) {
-      e.burnDps = Math.max(e.burnT > 0 ? e.burnDps : 0, amount * s.burn);
-      e.burnT = s.burnDur;
-      e.burnSrc = this;
+    if (s.burn && !e.thermal) {
+      // Igniting a chilled enemy: Thermal Shock instead of a burn.
+      if (e.slowT > 0 && e.reactT <= 0) game.thermalShock(e, this);
+      else {
+        e.burnDps = Math.max(e.burnT > 0 ? e.burnDps : 0, amount * s.burn);
+        e.burnT = s.burnDur;
+        e.burnSrc = this;
+      }
+      if (e.dead) return;
     }
     if (s.shred) e.shred = Math.min(s.shredMax, e.shred + s.shred);
     if (s.hitSlow) e.applySlow(s.hitSlow, 0.8);
@@ -389,6 +480,7 @@ export class Tower {
   update(dt, game) {
     this.built = Math.min(1, this.built + dt * 3);
     this.fireFlash = Math.max(0, this.fireFlash - dt);
+    if (this.jamT > 0) return; // offline: no fire, no pulses, no fields
     const s = this.stats;
     if (this.type === 'uplink') { this.angle += dt * 1.4; return; }
     const rateMul = (1 + this.buffRate) * (game.overclockT > 0 ? ABILITIES.overclock.mult : 1);
@@ -449,7 +541,7 @@ export class Tower {
 
   launchShell(game, target, dmg, mx, my) {
     const lead = Math.hypot(target.x - this.x, target.y - this.y) / (7 * TILE);
-    const sp = target.def.speed * TILE * (target.stunT > 0 ? 0 : 1);
+    const sp = target.speed * TILE * (target.stunT > 0 ? 0 : 1);
     game.projectiles.push({
       kind: 'plasma', x0: mx, y0: my, id: nextId++, t: 0,
       tx: target.x + Math.cos(target.angle) * sp * lead,
@@ -462,10 +554,19 @@ export class Tower {
     const s = this.stats;
     const hit = new Set([first]);
     const pts = [{ x: mx, y: my - 8 }, { x: first.x, y: first.y }];
+    // One link of the chain. Chilled targets superconduct (+50%, no falloff on the next jump); burning ones overload.
+    const zap = (e, m) => {
+      let d = dmg * m, cold = false;
+      if (e.slowT > 0 && !e.thermal) { d *= 1.5; cold = true; game.react('superconduct', e); }
+      if (e.burnT > 0 && e.reactT <= 0) game.overload(e, this);
+      if (!e.dead) this.hit(game, e, d, { shieldMul: s.shieldMul });
+      return cold;
+    };
     let cur = first, mult = 1;
-    this.hit(game, cur, dmg, { shieldMul: s.shieldMul });
+    let cold = zap(cur, 1);
     const jump = s.chainRange * TILE;
     for (let i = 1; i < s.chains; i++) {
+      if (cur.insulated) break; // grounded hull: the arc stops here
       let next = null, bd = jump * jump;
       for (const e of game.enemies) {
         if (hit.has(e) || !this.canHit(e)) continue;
@@ -473,9 +574,9 @@ export class Tower {
         if (d2 < bd && game.los(cur.x, cur.y, e.x, e.y)) { bd = d2; next = e; }
       }
       if (!next) break;
-      mult *= s.falloff;
+      if (!cold) mult *= s.falloff;
       hit.add(next);
-      this.hit(game, next, dmg * mult, { shieldMul: s.shieldMul });
+      cold = zap(next, mult);
       pts.push({ x: next.x, y: next.y });
       cur = next;
     }
@@ -490,7 +591,15 @@ export class Tower {
       const a = this.angle + (i - (n - 1) / 2) * 0.1;
       const ux = Math.cos(a), uy = Math.sin(a);
       const reach = this.reach(game, ux, uy, len);
-      for (const e of this.lineHits(game, this.x, this.y, ux, uy, reach, 6 * s.beamWidth)) this.hit(game, e, dmg, { pierce: true });
+      // The slug loses power with every enemy it passes through (not the Annihilator's).
+      let k = 1;
+      for (const e of this.lineHits(game, this.x, this.y, ux, uy, reach, 6 * s.beamWidth)) {
+        // Exposed: armor-stripped targets take a critical slug.
+        const crit = e.stripped && !e.dead;
+        if (crit) game.react('exposed', e);
+        this.hit(game, e, dmg * k * (crit ? 1.5 : 1), { pierce: true });
+        k = Math.max(0.5, k - s.slugFalloff);
+      }
       const ex = this.x + ux * reach, ey = this.y + uy * reach;
       if (reach < len) game.fx.sparks(ex, ey, this.def.color, 10, 140); // slug slams into a building
       game.fx.beam(mx, my, ex, ey, this.def.color, (5 + this.level) * s.beamWidth, 0.28, { tower: this, rail: true, width: s.beamWidth });
@@ -511,11 +620,16 @@ export class Tower {
     this.fireFlash = 0.3;
     const freezeAll = s.freezeEvery && this.pulses % s.freezeEvery === 0;
     for (const e of inside) {
+      // Chilling a burning enemy: Thermal Shock.
+      if (e.burnT > 0 && !e.thermal && e.reactT <= 0) { game.thermalShock(e, this); if (e.dead) continue; }
       e.applySlow(s.slow, s.slowDur, s.bossSlow);
-      if (s.brittle) { e.brittle = Math.max(e.brittleT > 0 ? e.brittle : 0, s.brittle); e.brittleT = s.slowDur; }
-      if (s.shatter) { e.shatter = Math.max(e.shatterT > 0 ? e.shatter : 0, s.shatter); e.shatterT = s.slowDur; e.shatterSrc = this; }
+      if (!e.thermal) {
+        if (s.brittle) { e.brittle = Math.max(e.brittleT > 0 ? e.brittle : 0, s.brittle); e.brittleT = s.slowDur; }
+        if (s.shatter) { e.shatter = Math.max(e.shatterT > 0 ? e.shatter : 0, s.shatter); e.shatterT = s.slowDur; e.shatterSrc = this; }
+        game.addXp(this, e.def.reward * 0.1); // crowd control earns its keep
+      }
       this.hit(game, e, dmg);
-      if (!e.dead && (freezeAll || (s.freezeChance && Math.random() < s.freezeChance))) {
+      if (!e.dead && !e.thermal && (freezeAll || (s.freezeChance && Math.random() < s.freezeChance))) {
         e.stun(s.freezeDur);
         e.frozenT = Math.max(e.frozenT, e.def.boss ? s.freezeDur * 0.3 : s.freezeDur);
       }
@@ -599,7 +713,11 @@ export class Game {
   constructor(mapIndex, hooks = {}) {
     this.mapIndex = mapIndex;
     this.map = MAPS[mapIndex];
-    this.hooks = { sfx: noop, message: noop, newThreat: noop, waveStart: noop, waveClear: noop, end: noop, leak: noop, ...hooks };
+    this.hooks = {
+      sfx: noop, message: noop, newThreat: noop, newVariant: noop, waveStart: noop, waveClear: noop, end: noop, leak: noop,
+      bossSpawn: noop, bossPhase: noop, steal: noop, escape: noop, recover: noop, jammed: noop, rankUp: noop, reaction: noop,
+      ...hooks,
+    };
     this.paths = this.map.paths.map(buildPath);
     const { grid, blocked } = buildGrid(this.map);
     this.grid = grid;
@@ -624,9 +742,13 @@ export class Game {
     this.coreHit = 0;
     this.state = 'build'; // build | playing | won | lost
     this.seen = new Set();
+    this.seenMods = new Set();
     this.cooldowns = { emp: 0, orbital: 0, overclock: 0 };
     this.overclockT = 0;
-    this.stats = { kills: 0, leaked: 0, spent: 0, earned: 0 };
+    this.packets = []; // data packets dropped by couriers, drifting back to the core
+    this.retired = []; // sold towers, kept for the end-of-run breakdown
+    this.reactShown = {};
+    this.stats = { kills: 0, leaked: 0, spent: 0, earned: 0, stolen: 0, escaped: 0, recovered: 0, reactions: {}, dmgByType: {} };
   }
 
   get core() { const p = this.paths[0].pts; return p[p.length - 1]; }
@@ -665,6 +787,7 @@ export class Game {
     const def = TOWERS[type];
     if (!this.canPlace(tx, ty, def.size || 1) || this.credits < def.cost) return null;
     const t = new Tower(type, tx, ty);
+    t.fresh = this.state === 'build';
     this.towers.push(t);
     this.setFootprint(t, 3);
     this.credits -= def.cost;
@@ -693,6 +816,7 @@ export class Game {
 
   sell(t) {
     const v = t.sellValue;
+    if (t.dmgDealt > 0 || t.kills > 0) this.retired.push({ type: t.type, tiers: [...t.tiers], rank: t.rank, dmg: t.dmgDealt, kills: t.kills, sold: true });
     this.credits += v;
     this.setFootprint(t, 0);
     this.towers = this.towers.filter((o) => o !== t);
@@ -711,6 +835,7 @@ export class Game {
       this.hooks.message(`EARLY CALL +${b}¢`, 'bonus');
     }
     this.wave++;
+    for (const t of this.towers) t.fresh = false;
     const n = this.wave;
     const groups = this.waveDef(n).map((grp) => ({ ...grp, t: -grp.delay, spawned: 0 }));
     this.spawners.push({ id: n, groups, counter: 0 });
@@ -722,21 +847,30 @@ export class Game {
         this.seen.add(grp.type);
         this.hooks.newThreat(grp.type);
       }
+      for (const m of grp.mods || []) {
+        if (!this.seenMods.has(m)) { this.seenMods.add(m); this.hooks.newVariant(m); }
+      }
     }
     this.hooks.waveStart(n, boss);
     return true;
   }
 
-  spawnEnemy(type, pathIdx, waveId, startDist = 0) {
-    const e = new Enemy(this, type, pathIdx, waveId, startDist);
+  spawnEnemy(type, pathIdx, waveId, startDist = 0, mods = null) {
+    const e = new Enemy(this, type, pathIdx, waveId, startDist, mods);
     this.enemies.push(e);
     this.waveAlive.set(waveId, (this.waveAlive.get(waveId) || 0) + 1);
+    if (e.def.boss) this.hooks.bossSpawn(e);
     return e;
   }
 
-  damage(e, amount, { tower = null, pierce = false, shieldMul = 1, quiet = false } = {}) {
-    if (e.dead || amount <= 0) return 0;
+  // `raw` damage (combo bursts) skips the variant resistances.
+  damage(e, amount, { tower = null, pierce = false, shieldMul = 1, quiet = false, raw = false } = {}) {
+    if (e.dead || amount <= 0 || e.phaseT > 0) return 0;
     let dealt = 0;
+    if (tower && !raw) {
+      if (e.mirror && tower.type === 'laser') amount *= 0.5;
+      if (e.insulated && tower.type === 'tesla') amount *= 0.5;
+    }
     // Debuffs from upgrades: marked, brittle (while chilled) and aura amplification.
     amount *= 1 + (e.markT > 0 ? e.markAmp : 0) + (e.brittleT > 0 && e.slowT > 0 ? e.brittle : 0) + e.auraAmp;
     if (e.shield > 0) {
@@ -756,16 +890,184 @@ export class Game {
       }
     }
     if (amount > 0) {
-      const armor = Math.max(0, e.armor - e.shred - e.auraArmorDown);
+      const armor = e.effArmor;
       if (armor && !pierce) amount = Math.max(amount * 0.25, amount - armor);
       dealt += Math.min(e.hp, amount);
       e.hp -= amount;
+      // Boss skulls: the hull stops at each threshold and the boss triggers its phase ability.
+      const ph = e.def.phases;
+      if (ph && e.phase < ph.length && e.hp <= ph[e.phase] * e.maxHp) {
+        dealt -= ph[e.phase] * e.maxHp - e.hp;
+        e.hp = ph[e.phase] * e.maxHp;
+        e.phase++;
+        this.bossPhase(e);
+      }
     }
     e.lastHit = this.time;
-    if (!quiet) e.flash = 0.06;
-    if (tower) tower.dmgDealt += dealt;
+    // Hit flash, at most ~8 a second: rapid-fire towers strobe the target instead of blowing it out to white.
+    if (!quiet && this.time - (e.lastFlash ?? -1) > 0.12) { e.flash = 0.05; e.lastFlash = this.time; }
+    if (tower) {
+      tower.dmgDealt += dealt;
+      this.stats.dmgByType[tower.type] = (this.stats.dmgByType[tower.type] || 0) + dealt;
+      if (dealt > 0) this.addXp(tower, (dealt / (e.maxHp + e.maxShield)) * e.def.reward);
+    }
     if (e.hp <= 0) this.kill(e, tower);
     return dealt;
+  }
+
+  // ---------------------------------------------------------------- veterancy
+  addXp(t, xp) {
+    t.xp += xp;
+    this.checkRank(t);
+    const u = t.buffSrc;
+    if (u && u !== t) { u.xp += xp * 0.25; this.checkRank(u); }
+  }
+
+  checkRank(t) {
+    while (t.rank < VET.xp.length && t.xp >= VET.xp[t.rank]) {
+      t.rank++;
+      t.refresh();
+      this.fx.emit({ type: 'rankup', tower: t, rank: t.rank });
+      this.fx.text(t.x, t.y - 34, `RANK ${VET.numerals[t.rank]}`, '#ffe600', 13);
+      this.hooks.rankUp(t);
+    }
+  }
+
+  // ---------------------------------------------------------------- status combos
+  react(kind, e) {
+    this.stats.reactions[kind] = (this.stats.reactions[kind] || 0) + 1;
+    // Name pops up at most every 0.4s per combo, so a Tesla sweeping a frozen crowd doesn't spam the screen.
+    if (this.time - (this.reactShown[kind] ?? -9) > 0.4) {
+      this.reactShown[kind] = this.time;
+      this.fx.text(e.x, e.y - e.radius - 16, REACTIONS[kind].name, REACTIONS[kind].color, 12);
+      this.fx.emit({ type: 'reaction', kind, x: e.x, y: e.y, enemy: e });
+    }
+    this.hooks.reaction(kind, e);
+  }
+
+  // Fire meets cold: a burst of max-hull damage, the burn is spent and the armor cracks open.
+  thermalShock(e, tower) {
+    e.reactT = 1.5;
+    e.burnT = 0;
+    e.crackT = 3;
+    this.react('thermal', e);
+    this.damage(e, e.maxHp * (e.def.boss ? 0.04 : 0.12), { tower, pierce: true, raw: true });
+  }
+
+  // Lightning through a burning enemy detonates what's left of the burn, splashing its neighbours.
+  overload(e, tower) {
+    const burst = e.burnDps * e.burnT * 1.5;
+    e.burnT = 0;
+    e.reactT = 1;
+    if (burst < 1) return;
+    this.react('overload', e);
+    const r = TILE * 1.1;
+    for (const o of [...this.enemies]) {
+      if (o === e || o.dead || (o.x - e.x) ** 2 + (o.y - e.y) ** 2 > r * r) continue;
+      this.damage(o, burst * 0.5, { tower, pierce: true, raw: true, quiet: true });
+    }
+    this.damage(e, burst, { tower, pierce: true, raw: true });
+  }
+
+  // ---------------------------------------------------------------- jamming & boss phases
+  jamTower(t, dur, kind) {
+    if (t.jamT <= 0) this.fx.emit({ type: 'jam', tower: t, kind });
+    if (dur >= t.jamT) t.jamKind = kind; // the longest outage names it (a passing jammer doesn't relabel a hijack)
+    t.jamT = Math.max(t.jamT, dur);
+  }
+
+  bossPhase(e) {
+    const n = e.phase;
+    e.phaseT = e.type === 'overmind' ? 1.5 : 1.2;
+    this.shake = Math.max(this.shake, 12);
+    this.fx.emit({ type: 'bossphase', enemy: e, n });
+    this.hooks.sfx('emp', e);
+    if (e.type === 'titan') {
+      // EMP vent: knocks out every tower nearby (firewalls don't help against a raw pulse), then surges forward.
+      const r = 3.2 * TILE;
+      for (const t of this.towers) {
+        if ((t.x - e.x) ** 2 + (t.y - e.y) ** 2 <= (r + TILE * t.size * 0.5) ** 2) this.jamTower(t, 3.5, 'emp');
+      }
+      e.surgeT = 3;
+      this.fx.ring(e.x, e.y, 10, r, '#ff2bd6', 0.7, 4);
+    } else if (e.type === 'overmind') {
+      // Hijack: the two most valuable towers within reach go dark.
+      const r = 5 * TILE;
+      const near = this.towers.filter((t) => (t.x - e.x) ** 2 + (t.y - e.y) ** 2 <= r * r).sort((a, b) => b.invested - a.invested).slice(0, 2);
+      for (const t of near) {
+        this.jamTower(t, 5, 'hijack');
+        this.fx.emit({ type: 'hijack', enemy: e, tower: t });
+      }
+      if (n === 1) {
+        for (let i = 0; i < 4; i++) this.spawnEnemy('phantom', e.pathIdx, e.waveId, Math.max(0, e.dist - 20 - i * 16));
+        for (let i = 0; i < 3; i++) this.spawnEnemy('drone', e.pathIdx, e.waveId, Math.max(0, e.dist - 10 - i * 14));
+      } else if (n === 2) {
+        e.shield = Math.max(e.shield, e.maxShield * 0.6);
+      } else if (n === 3) {
+        e.speedMul *= 1.35;
+        e.spawnEvery *= 0.5;
+      }
+    }
+    this.hooks.bossPhase(e, n);
+  }
+
+  // ---------------------------------------------------------------- data couriers
+  steal(e) {
+    e.carrying = true;
+    e.dir = -1;
+    e.dist = e.path.length - 0.01;
+    this.stats.stolen++;
+    const c = this.core;
+    this.fx.emit({ type: 'steal', enemy: e });
+    this.fx.text(c.x, c.y - 30, 'DATA STOLEN', '#3dffc5', 14);
+    this.coreHit = 0.3;
+    this.hooks.steal(e);
+    this.hooks.sfx('leak', e);
+  }
+
+  escape(e) {
+    if (e.dead) return;
+    this.stats.escaped++;
+    this.breach(e, e.def.courier.packet);
+    this.hooks.escape(e);
+  }
+
+  // A courier killed with a packet drops it; the packet drifts back along the road to the core.
+  dropPacket(e) {
+    const pk = { id: nextId++, path: e.path, dist: e.dist, seg: e.seg, x: e.x, y: e.y };
+    this.packets.push(pk);
+    this.fx.emit({ type: 'drop', packet: pk });
+  }
+
+  updatePackets(dt) {
+    if (!this.packets.length) return;
+    for (const pk of this.packets) {
+      pk.dist += 1.1 * TILE * dt;
+      if (pk.dist >= pk.path.length) {
+        pk.done = true;
+        this.stats.recovered++;
+        const c = this.core;
+        this.fx.text(c.x, c.y - 30, 'DATA RECOVERED', '#39ff14', 13);
+        this.fx.emit({ type: 'recover', packet: pk });
+        this.hooks.recover(pk);
+        continue;
+      }
+      const q = pathPoint(pk.path, pk.dist, pk.seg);
+      pk.seg = q.seg; pk.x = q.x; pk.y = q.y;
+      // Another courier on its way in snatches it and turns back.
+      for (const e of this.enemies) {
+        if (e.dead || !e.def.courier || e.carrying || (e.x - pk.x) ** 2 + (e.y - pk.y) ** 2 > (0.6 * TILE) ** 2) continue;
+        pk.done = true;
+        e.carrying = true;
+        e.dir = -1;
+        e.updatePos();
+        this.stats.stolen++;
+        this.fx.emit({ type: 'grab', packet: pk, enemy: e });
+        this.hooks.steal(e);
+        break;
+      }
+    }
+    this.packets = this.packets.filter((pk) => !pk.done);
   }
 
   kill(e, tower) {
@@ -803,24 +1105,30 @@ export class Game {
       }
     }
     this.hooks.sfx(big ? 'bossdeath' : e.radius > 16 ? 'explode' : 'pop', e);
+    if (e.carrying) this.dropPacket(e);
     if (e.def.splits) {
       for (let i = 0; i < e.def.splits.count; i++) {
-        this.spawnEnemy(e.def.splits.type, e.pathIdx, e.waveId, Math.max(0, e.dist - i * 10));
+        this.spawnEnemy(e.def.splits.type, e.pathIdx, e.waveId, Math.max(0, e.dist - i * 10), e.mods);
       }
     }
   }
 
   leak(e) {
     if (e.dead) return;
+    this.breach(e, coreDamage(e));
+    const c = this.core;
+    this.fx.explosion(c.x, c.y, '#ff3355', 30);
+  }
+
+  // An enemy got through (into the core, or out of the district with a packet): integrity damage.
+  breach(e, dmg) {
     e.dead = true;
     e.leaked = true;
-    this.lives = Math.max(0, this.lives - coreDamage(e));
+    this.lives = Math.max(0, this.lives - dmg);
     this.stats.leaked++;
     this.coreHit = 0.6;
     this.shake = Math.max(this.shake, e.def.boss ? 20 : 7);
-    const c = this.core;
-    this.fx.emit({ type: 'leak', enemy: e });
-    this.fx.explosion(c.x, c.y, '#ff3355', 30);
+    this.fx.emit({ type: 'leak', enemy: e, escape: e.dir < 0 });
     this.hooks.leak(e);
     this.hooks.sfx('leak', e);
     if (this.lives <= 0 && this.state !== 'lost') {
@@ -836,7 +1144,10 @@ export class Game {
       if (e.dead || (e.flying && !s.air)) continue;
       const d = Math.hypot(e.x - x, e.y - y);
       if (d > r + e.radius * 0.5) continue;
-      tower.hit(this, e, dmg * (1 - 0.5 * Math.min(1, d / r)));
+      let hit = dmg * (1 - 0.5 * Math.min(1, d / r));
+      // Fracture: the blast shatters a frozen enemy's ice for double damage.
+      if (e.frozenT > 0) { hit *= 2; e.frozenT = 0; e.stunT = 0; this.react('fracture', e); }
+      tower.hit(this, e, hit);
       if (s.knockback && !e.dead) e.knockBack(s.knockback * TILE);
     }
     this.fx.explosion(x, y, color, r * (main ? 0.55 : 0.4));
@@ -889,7 +1200,7 @@ export class Game {
         while (grp.spawned < grp.count && grp.t >= 0) {
           const boss = ENEMIES[grp.type].boss;
           const pathIdx = boss ? 0 : s.counter++ % this.paths.length;
-          this.spawnEnemy(grp.type, pathIdx, s.id);
+          this.spawnEnemy(grp.type, pathIdx, s.id, 0, grp.mods);
           grp.spawned++;
           grp.t -= grp.gap;
         }
@@ -897,26 +1208,46 @@ export class Game {
       s.done = s.groups.every((grp) => grp.spawned >= grp.count);
     }
 
-    // Buffs, auras & reveal
-    const uplinks = this.towers.filter((t) => t.type === 'uplink');
+    // Jamming: Signal Jammer fields knock nearby towers offline unless an Intrusion Uplink firewalls them.
+    const covers = (u, t) => (u.x - t.x) ** 2 + (u.y - t.y) ** 2 <= (u.range + TILE * t.size * 0.5) ** 2;
+    for (const t of this.towers) t.jamT = Math.max(0, t.jamT - dt);
+    const jammers = this.enemies.filter((e) => e.def.jam && !e.dead && e.stunT <= 0);
+    if (jammers.length) {
+      const firewalls = this.towers.filter((u) => u.stats.firewall && u.jamT <= 0);
+      for (const e of jammers) {
+        const r = e.def.jam.radius * TILE;
+        for (const t of this.towers) {
+          if ((t.x - e.x) ** 2 + (t.y - e.y) ** 2 > (r + TILE * t.size * 0.5) ** 2) continue;
+          if (t.stats.firewall || firewalls.some((u) => covers(u, t))) { t.firewalled = 0.4; continue; }
+          if (t.jamT <= 0) this.hooks.jammed(t, e);
+          this.jamTower(t, 0.25, 'field');
+        }
+      }
+    }
+    for (const t of this.towers) if (t.firewalled > 0) t.firewalled -= dt;
+
+    // Buffs, auras & reveal (offline towers give nothing)
+    const online = this.towers.filter((t) => t.jamT <= 0);
+    const uplinks = online.filter((t) => t.type === 'uplink');
     for (const t of this.towers) {
-      t.buffDmg = 0; t.buffRate = 0; t.camoGrant = false;
+      t.buffDmg = 0; t.buffRate = 0; t.camoGrant = false; t.buffSrc = null;
       for (const u of uplinks) {
         if (u === t) continue;
-        if ((u.x - t.x) ** 2 + (u.y - t.y) ** 2 <= (u.range + TILE * t.size * 0.5) ** 2) {
+        if (covers(u, t)) {
+          if (u.stats.buffDmg >= t.buffDmg) t.buffSrc = u;
           t.buffDmg = Math.max(t.buffDmg, u.stats.buffDmg);
           t.buffRate = Math.max(t.buffRate, u.stats.buffRate);
           if (u.stats.grantCamo) t.camoGrant = true;
         }
       }
     }
-    const revealers = this.towers.filter((t) => t.type === 'uplink' || t.stats.reveal);
-    const auras = this.towers.filter((t) => t.stats.auraDps || t.stats.auraSlow || t.stats.auraShieldDrain || t.stats.auraArmorDown || t.stats.auraAmp || t.stats.globalSlow);
+    const revealers = online.filter((t) => t.type === 'uplink' || t.stats.reveal);
+    const auras = online.filter((t) => t.stats.auraDps || t.stats.auraSlow || t.stats.auraShieldDrain || t.stats.auraArmorDown || t.stats.auraAmp || t.stats.globalSlow);
     for (const e of this.enemies) {
       e.auraSlow = 0; e.auraAmp = 0; e.auraArmorDown = 0;
       for (const t of auras) {
         const s = t.stats;
-        if (s.globalSlow) e.auraSlow = Math.max(e.auraSlow, s.globalSlow);
+        if (s.globalSlow && !e.thermal) e.auraSlow = Math.max(e.auraSlow, s.globalSlow);
         if (!t.inRange(e, t.range)) continue;
         if (s.auraSlow) e.auraSlow = Math.max(e.auraSlow, s.auraSlow);
         if (s.auraAmp) e.auraAmp = Math.max(e.auraAmp, s.auraAmp);
@@ -924,7 +1255,7 @@ export class Game {
         if (s.auraShieldDrain && e.shield > 0) e.shield = Math.max(0, e.shield - e.maxShield * s.auraShieldDrain * dt);
         if (s.auraDps && !e.dead) this.damage(e, s.dmg * (1 + t.buffDmg) * s.auraDps * dt, { tower: t, quiet: true });
       }
-      if (!e.def.cloaked) continue;
+      if (!e.cloaked) continue;
       // Permanent camo: only revealers (Uplinks, Cold Snap) and stuns (EMP, freezes) expose it.
       e.revealed = e.stunT > 0 || revealers.some((u) => u.inRange(e, u.range));
     }
@@ -943,6 +1274,7 @@ export class Game {
 
     for (const e of this.enemies) if (!e.dead) e.update(dt, this);
     for (const t of this.towers) t.update(dt, this);
+    this.updatePackets(dt);
 
     // Projectiles
     for (const p of this.projectiles) {

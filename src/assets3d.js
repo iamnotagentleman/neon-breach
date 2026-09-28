@@ -29,6 +29,9 @@ export const ENEMY_VIS = {
   splitter: { model: 'enemy_splitter', scale: 1.55, clip: 'crawl', animRate: 1.4 },
   mite: { model: 'enemy_mite', scale: 1.6, clip: 'crawl', animRate: 1.15 },
   medic: { model: 'enemy_medic', scale: 1.6, hover: 0.55 },
+  // New threats reuse a cast model with its neon re-hued (same shader recolor as the tower paths).
+  jammer: { model: 'enemy_medic', scale: 1.75, hover: 0.6, recolor: '#ff2a6a', tint: 0.15, darken: 0.42 },
+  courier: { model: 'enemy_runner', height: 0.98, clip: 'run', animRate: 0.72, recolor: '#3dffc5', tint: 0.4 },
   titan: { model: 'boss_titan', height: 3.0, clip: 'walk', animRate: 1.05 },
   overmind: { model: 'boss_overmind', scale: 2.0, hover: 0.85, shield: 1.75, spin: true },
 };
@@ -76,7 +79,7 @@ const RECOLOR_EMISSIVE = `#include <emissivemap_fragment>
     vec3 hue = uPathColor / max(max(uPathColor.r, max(uPathColor.g, uPathColor.b)), 1e-4);
     totalEmissiveRadiance = mix(vec3(1.0), hue, max(sat, 0.6)) * eMax;
   }`;
-function recolorMaterial(src, hex, tint) {
+export function recolorMaterial(src, hex, tint) {
   const m = src.clone();
   const color = new THREE.Color(hex);
   m.onBeforeCompile = (shader) => {

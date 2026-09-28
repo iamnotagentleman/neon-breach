@@ -14,9 +14,9 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
-import { TILE, COLS, ROWS, TOWERS, ABILITIES } from './config.js';
-import { ENEMY_VIS } from './assets3d.js';
-import { seededRandom, footprintAnchor, segmentBlock } from './game.js';
+import { TILE, COLS, ROWS, TOWERS, ABILITIES, MODS, VET } from './config.js';
+import { ENEMY_VIS, recolorMaterial } from './assets3d.js';
+import { seededRandom, footprintAnchor, segmentBlock, coverageMap } from './game.js';
 
 const HW = COLS / 2, HH = ROWS / 2;
 const wx = (px) => px / TILE - HW;
@@ -106,6 +106,10 @@ export class Renderer3D {
     this.texts = [];
     this.lightPool = [];
     this.shakeT = 0;
+    this.packetViews = new Map();
+    this.cine = null; // boss intro camera
+    // Player settings: shake 0..1, floating texts, placement heat map.
+    this.settings = { shake: 1, texts: true, heatmap: true };
 
     const r = this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
     this.maxDpr = Math.min(window.devicePixelRatio || 1, 1.75);
@@ -370,6 +374,29 @@ export class Renderer3D {
     this.tileMarker.renderOrder = 5;
     this.scene.add(this.tileMarker);
 
+    // Placement heat map: one tinted pad per tile, colored by how much road a tower placed there would cover.
+    const heatTex = canvasTexture(64, 64, (g, w) => {
+      g.clearRect(0, 0, w, w);
+      g.fillStyle = 'rgba(255,255,255,0.32)'; g.fillRect(6, 6, w - 12, w - 12);
+      g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = 3; g.strokeRect(6, 6, w - 12, w - 12);
+    }, false);
+    this.heatMesh = new THREE.InstancedMesh(new THREE.PlaneGeometry(0.86, 0.86).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ map: heatTex, transparent: true, opacity: 0.7, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false }), COLS * ROWS);
+    const hm = new THREE.Matrix4();
+    for (let ty = 0; ty < ROWS; ty++) for (let tx = 0; tx < COLS; tx++) {
+      this.heatMesh.setMatrixAt(ty * COLS + tx, hm.makeTranslation(tx - HW + 0.5, 0.112, ty - HH + 0.5));
+      this.heatMesh.setColorAt(ty * COLS + tx, new THREE.Color(0, 0, 0));
+    }
+    this.heatMesh.renderOrder = 4;
+    this.heatMesh.visible = false;
+    this.heatMesh.frustumCulled = false;
+    this.scene.add(this.heatMesh);
+    this.heat = { key: '', data: null, max: 1 };
+
+    // Data packets (carried by couriers, or drifting home): a small faceted crystal like the core's.
+    this.packetGeo = new THREE.IcosahedronGeometry(0.13, 0);
+    this.packetMat = new THREE.MeshStandardMaterial({ color: '#06302a', emissive: '#3dffc5', emissiveIntensity: 1.8, metalness: 0.2, roughness: 0.15, flatShading: true });
+
     // Range outline: a plain, static ring.
     this.rangeRing = new THREE.Group();
     const ringMat = new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide });
@@ -566,6 +593,90 @@ export class Renderer3D {
       fromT: this.controls.target.clone(), fromP: this.camera.position.clone(),
       toT: this.target.clone(), toP: this.target.clone().addScaledVector(this.camDir, dist),
     };
+  }
+
+  // ------------------------------------------------------------------ boss intro camera
+  // Fly in low in front of the boss, follow it while the name card shows, then return to the player's view.
+  startCinematic(enemy, dur = 3.2) {
+    if (this.cine) this.endCinematic(true);
+    this.cine = {
+      enemy, t: 0, dur, out: 0.9,
+      fromP: this.camera.position.clone(), fromT: this.controls.target.clone(),
+      pos: this.camera.position.clone(), look: this.controls.target.clone(),
+      hidden: new Set(), // buildings and towers pulled out of the shot so the boss stays in view
+    };
+    this.controls.enabled = false;
+  }
+
+  // Hide whatever stands between the camera and the boss (or around the camera itself); it stays hidden for the
+  // rest of the intro and comes back when the camera has returned.
+  clearShot(c, center, height) {
+    const cam = this.camera.position;
+    const targets = [center, center.clone().add(tmpV2.set(0, height * 0.45, 0)), center.clone().add(tmpV2.set(0, -height * 0.4, 0))];
+    const ray = this.shotRay || (this.shotRay = new THREE.Ray());
+    const blocks = (box) => {
+      if (box.containsPoint(cam) || box.distanceToPoint(cam) < 0.6) return true;
+      for (const p of targets) {
+        const d = cam.distanceTo(p);
+        ray.origin.copy(cam);
+        ray.direction.copy(p).sub(cam).normalize();
+        const hit = ray.intersectBox(box, tmpV);
+        if (hit && cam.distanceTo(hit) < d - 0.3) return true;
+      }
+      return false;
+    };
+    for (const b of this.buildingViews || []) {
+      if (!c.hidden.has(b) && blocks(b.userData.box)) { b.visible = false; c.hidden.add(b); }
+    }
+    const box = this.towerBox || (this.towerBox = new THREE.Box3());
+    for (const v of this.towerViews.values()) {
+      if (c.hidden.has(v.root)) continue;
+      box.setFromObject(v.root).expandByScalar(0.05);
+      if (blocks(box)) { v.root.visible = false; c.hidden.add(v.root); }
+    }
+  }
+
+  skipCinematic() { if (this.cine && this.cine.t < this.cine.dur) this.cine.t = this.cine.dur; }
+
+  endCinematic(snap = false) {
+    const c = this.cine;
+    if (!c) return;
+    this.cine = null;
+    this.controls.enabled = true;
+    for (const o of c.hidden) o.visible = true;
+    if (snap) { this.camera.position.copy(c.fromP); this.controls.target.copy(c.fromT); this.camera.lookAt(c.fromT); }
+  }
+
+  get cinematic() { return !!this.cine && this.cine.t < this.cine.dur; }
+
+  updateCinematic(dt) {
+    const c = this.cine;
+    c.t += dt;
+    const ease = (k) => 1 - (1 - Math.min(1, Math.max(0, k))) ** 3;
+    const v = this.enemyViews.get(c.enemy.id);
+    if (c.t < c.dur && v) {
+      const center = this.enemyCenter(v, new THREE.Vector3());
+      const a = c.enemy.angle;
+      const size = Math.max(1.5, v.height);
+      // Ahead of the boss and a little to its side, at about its chest height.
+      const fwd = tmpV.set(Math.cos(a), 0, Math.sin(a));
+      const want = center.clone().addScaledVector(fwd, size * 2.1).add(tmpV2.set(-fwd.z * size * 0.9, size * 0.45, fwd.x * size * 0.9));
+      const look = center.clone().add(tmpV2.set(0, size * 0.1, 0));
+      const k = ease(c.t / 0.8);
+      c.pos.lerpVectors(c.fromP, want, k);
+      c.look.lerpVectors(c.fromT, look, k);
+      c.lastP = c.pos.clone(); c.lastL = c.look.clone();
+    } else {
+      if (!c.lastP) { this.endCinematic(true); return; }
+      if (c.t < c.dur) c.t = c.dur; // boss vanished mid-intro
+      const k = ease((c.t - c.dur) / c.out);
+      c.pos.lerpVectors(c.lastP, c.fromP, k);
+      c.look.lerpVectors(c.lastL, c.fromT, k);
+      if (k >= 1) { this.endCinematic(true); return; }
+    }
+    this.camera.position.copy(c.pos);
+    this.camera.lookAt(c.look);
+    if (v) this.clearShot(c, this.enemyCenter(v, new THREE.Vector3()), v.height);
   }
 
   updateCamera(dt) {
@@ -797,6 +908,7 @@ export class Renderer3D {
 
     // Buildings on blocked tiles.
     const bTpl = this.assets.get('env_building');
+    this.buildingViews = [];
     for (const [x, y, size = 1] of game.blocked) {
       const b = bTpl ? bTpl.scene.clone(true) : new THREE.Mesh(new THREE.BoxGeometry(0.85, 1.2, 0.85), padMat);
       b.position.set(x - HW + size / 2, 0, y - HH + size / 2);
@@ -804,6 +916,9 @@ export class Renderer3D {
       // 2x2 lots get a tall tower block; singles vary in height.
       b.scale.set(size * 1.05, size > 1 ? 2.6 + rnd() * 1.4 : 0.75 + rnd() * 0.9, size * 1.05);
       g.add(b);
+      b.updateMatrixWorld(true);
+      b.userData.box = new THREE.Box3().setFromObject(b).expandByScalar(0.08);
+      this.buildingViews.push(b);
     }
 
     // Spawn portals.
@@ -866,6 +981,15 @@ export class Renderer3D {
       c.traverse((o) => { if (o.isMesh && !o.material.userData?.pathRecolor) o.material = o.material.clone(); });
       grp.add(c);
     }
+    // Recolored enemies (new threats, variants) use the path-recolor program, skinned and static.
+    for (const name of new Set(Object.values(ENEMY_VIS).map((v) => v.model))) {
+      const m = this.assets.get(name);
+      if (!m) continue;
+      const c = m.animations.length ? SkeletonUtils.clone(m.scene) : m.scene.clone(true);
+      c.traverse((o) => { if (o.isMesh) o.material = recolorMaterial(o.material, '#ff2a6a', 0.4); });
+      grp.add(c);
+    }
+    grp.add(new THREE.Mesh(this.packetGeo, this.packetMat));
     this.dynGroup.add(grp);
     const before = this.fxItems.length;
     const p = new THREE.Vector3(0, -30, 0);
@@ -893,8 +1017,11 @@ export class Renderer3D {
     for (const v of this.towerViews.values()) this.dynGroup.remove(v.root);
     for (const v of this.enemyViews.values()) this.dynGroup.remove(v.root);
     for (const v of this.shellViews.values()) this.dynGroup.remove(v);
+    for (const v of this.packetViews.values()) this.dynGroup.remove(v);
     for (const f of this.fxItems) this.dynGroup.remove(f.obj);
-    this.towerViews.clear(); this.enemyViews.clear(); this.shellViews.clear();
+    this.towerViews.clear(); this.enemyViews.clear(); this.shellViews.clear(); this.packetViews.clear();
+    this.endCinematic(true);
+    this.heat.key = '';
     this.fxItems = []; this.texts = [];
     this.sparks.clear();
     this.smoke.clear();
@@ -956,6 +1083,10 @@ export class Renderer3D {
     v.model = model;
     v.head = head;
     v.muzzle = muzzle;
+    // Rotary cannons (Photon Storm) have their barrel cluster as a separate node that spins while it fires.
+    v.barrels = model.getObjectByName('barrels') || null;
+    v.spin = 0;
+    v.lastShot = -9;
     v.topY = (tpl ? tpl.size.y : 0.9) * towerScale(v.size, t.level) * 0.92;
     (head || v.root).add(v.flash);
     v.flash.position.copy(head ? muzzle : new THREE.Vector3(0, v.topY, 0));
@@ -1027,12 +1158,33 @@ export class Renderer3D {
           v.head.position.z = v.head.userData.bz - Math.cos(v.yaw) * back;
         }
       }
-      v.flash.material.opacity = Math.min(1, t.fireFlash * 8);
-      v.flash.scale.setScalar((0.35 + t.fireFlash * 3) * v.size);
+      if (v.barrels) {
+        // Spin up fast while firing, wind down slowly after the last shot; the muzzle flash strobes.
+        const firing = this.time - v.lastShot < 0.25 && t.jamT <= 0;
+        v.spin += ((firing ? 30 : 0) - v.spin) * Math.min(1, dt * (firing ? 5 : 1.2));
+        v.barrels.rotation.z += v.spin * dt;
+        v.flash.material.opacity = firing ? (Math.random() < 0.5 ? 0.8 : 0.3) : 0;
+        v.flash.scale.setScalar((firing ? 0.2 + Math.random() * 0.15 : 0.15) * v.size);
+      } else {
+        v.flash.material.opacity = Math.min(1, t.fireFlash * 8);
+        v.flash.scale.setScalar((0.35 + t.fireFlash * 3) * v.size);
+      }
       if (v.light) v.light.intensity = t.fireFlash > 0 ? 2.5 + Math.random() * 2.5 : 0.6;
       if (v.orb) v.orb.scale.setScalar(v.orb.userData.base + Math.sin(this.time * 9 + t.id) * 0.04 + t.fireFlash * 0.8 * v.size);
       const sel = ui.selected === t;
-      v.ring.material.color.copy(v.ringColor || col(t.def.color)).multiplyScalar(sel ? 4 : 2);
+      // Offline (jammed / EMP'd / hijacked): crackling static, the tesla orb gutters, the base ring turns warning red.
+      const jammed = t.jamT > 0;
+      const jamCol = t.jamKind === 'hijack' ? '#ffe600' : '#ff2a6a';
+      if (jammed) {
+        if (Math.random() < dt * 16 && !this.fxBusy) {
+          const a = Math.random() * TAU, r = 0.25 * v.size;
+          this.sparkBurst(v.root.position.x + Math.cos(a) * r, v.topY * (0.5 + Math.random() * 0.5), v.root.position.z + Math.sin(a) * r, jamCol, 2, 1.6, { life: 0.18, size: 0.025, grav: 0, up: 0.1 });
+        }
+        if (v.orb) v.orb.scale.setScalar(v.orb.userData.base * (Math.random() < 0.3 ? 0.2 : 0.6));
+        if (v.light) v.light.intensity = Math.random() < 0.2 ? 1.5 : 0;
+      }
+      const ringCol = jammed ? col(jamCol) : t.firewalled > 0 ? col('#39ff14') : (v.ringColor || col(t.def.color));
+      v.ring.material.color.copy(ringCol).multiplyScalar(jammed ? 2.5 + Math.random() * 1.5 : sel ? 4 : 2);
     }
     for (const [id, v] of this.towerViews) {
       if (!seen.has(id)) {
@@ -1085,10 +1237,16 @@ export class Renderer3D {
       obj = new THREE.Mesh(new THREE.SphereGeometry(0.25), new THREE.MeshStandardMaterial({ color: e.def.color }));
     }
     const mats = [];
+    // A variant wears its color on its neon (hue-shifted like the tower paths); new threats have their own hue.
+    const variant = e.mods.find((m) => m !== 'ghosted');
+    const recolor = variant ? MODS[variant].color : vis.recolor;
+    const tint = variant ? (variant === 'mirror' ? 0.5 : 0.38) : vis.tint;
     obj.traverse((o) => {
       if (!o.isMesh) return;
       o.castShadow = !!e.def.boss;
-      o.material = o.material.clone();
+      o.material = recolor ? recolorMaterial(o.material, recolor, tint) : o.material.clone();
+      if (variant === 'mirror') { o.material.metalness = 1; o.material.roughness = 0.16; }
+      else if (vis.darken && !variant) o.material.color.multiplyScalar(vis.darken); // gunmetal instead of white armor
       mats.push(o.material);
       o.material.userData.baseEmissive = o.material.emissiveIntensity;
       o.material.userData.baseEmissiveColor = o.material.emissive.clone();
@@ -1099,18 +1257,35 @@ export class Renderer3D {
     obj.scale.setScalar(vis.height && tpl ? vis.height / tpl.size.y : vis.scale || 1);
     const root = new THREE.Group();
     root.add(inner);
+    const height = vis.height || (tpl ? tpl.size.y * (vis.scale || 1) : 0.5);
     let shield = null;
-    if (vis.shield) {
+    const shieldSize = vis.shield || (e.maxShield > 0 ? Math.max(0.45, height * 0.62) : 0); // Warded variants
+    if (shieldSize) {
       shield = new THREE.Mesh(this.sphereGeo, this.shieldMatBase.clone());
-      shield.scale.setScalar(vis.shield);
-      shield.position.y = (vis.hover || 0) + vis.shield * 0.55;
+      shield.scale.setScalar(shieldSize);
+      shield.position.y = (vis.hover || 0) + (vis.shield ? shieldSize * 0.55 : height * 0.5);
       root.add(shield);
+    }
+    // Courier's stolen packet, riding above its head.
+    let packet = null;
+    if (e.def.courier) {
+      packet = new THREE.Mesh(this.packetGeo, this.packetMat);
+      packet.position.y = height + 0.28;
+      packet.visible = false;
+      root.add(packet);
+    }
+    // Jammer field: a faint disc on the road showing the area it knocks out.
+    let jamDisc = null;
+    if (e.def.jam) {
+      jamDisc = new THREE.Mesh(this.ringPlane, new THREE.MeshBasicMaterial({ map: this.tex.ring, color: col(e.def.color).clone().multiplyScalar(0.9), transparent: true, opacity: 0.35, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false }));
+      jamDisc.scale.setScalar(e.def.jam.radius);
+      jamDisc.renderOrder = 5;
+      root.add(jamDisc);
     }
     // Spawn-in glitch: start scaled down.
     root.scale.setScalar(0.01);
     this.dynGroup.add(root);
-    const height = vis.height || (tpl ? tpl.size.y * (vis.scale || 1) : 0.5);
-    return { root, inner, obj, mixer, action, mats, vis, shield, height, yaw: yawOf(e.angle), cloaked: false, slowed: false, age: 0, healT: Math.random() };
+    return { root, inner, obj, mixer, action, mats, vis, shield, shieldSize, packet, jamDisc, height, yaw: yawOf(e.angle), cloaked: false, slowed: false, age: 0, healT: Math.random(), jamPulse: Math.random() };
   }
 
   enemyCenter(v, out) {
@@ -1135,7 +1310,7 @@ export class Renderer3D {
       if (v.mixer) {
         const moving = e.stunT <= 0;
         const slow = e.slowT > 0 ? 1 - e.slowAmt * (e.def.boss ? 0.5 : 1) : 1;
-        v.mixer.update(moving ? dt * v.vis.animRate * e.def.speed * slow : 0);
+        v.mixer.update(moving ? dt * v.vis.animRate * e.speed * slow : 0);
       }
       // Cloak: a flickering violet hologram, readable but clearly "not targetable".
       const cloaked = !e.revealed;
@@ -1157,7 +1332,7 @@ export class Renderer3D {
       const flashing = e.flash > 0;
       if (flashing || v.flashing) {
         for (const m of v.mats) {
-          m.emissiveIntensity = (m.userData.baseEmissive || 0) + e.flash * 30;
+          m.emissiveIntensity = (m.userData.baseEmissive || 0) + e.flash * 12;
           if (!m.emissiveMap) m.emissive.copy(flashing ? NO_TINT : m.userData.baseEmissiveColor);
         }
         v.flashing = flashing;
@@ -1176,11 +1351,43 @@ export class Renderer3D {
       }
       if (v.shield) {
         const k = e.maxShield ? e.shield / e.maxShield : 0;
-        v.shield.visible = k > 0.01 && !cloaked;
+        v.shield.visible = (k > 0.01 && !cloaked) || e.phaseT > 0;
         v.shieldPulse = Math.max(0, (v.shieldPulse || 0) - dt * 6);
-        v.shield.material.uniforms.opacity.value = 0.25 + k * 0.75 + v.shieldPulse * 1.2;
-        v.shield.scale.setScalar(v.vis.shield * (1 + v.shieldPulse * 0.06));
+        v.shield.material.uniforms.opacity.value = 0.25 + k * 0.75 + v.shieldPulse * 1.2 + (e.phaseT > 0 ? 0.8 : 0);
+        v.shield.scale.setScalar(v.shieldSize * (1 + v.shieldPulse * 0.06));
         v.shield.material.uniforms.time.value = this.time;
+      }
+      // Boss phase transition: untouchable, flickering white-hot.
+      if (e.phaseT > 0) {
+        const f = 0.5 + 0.5 * Math.sin(this.time * 40);
+        for (const m of v.mats) m.emissiveIntensity = (m.userData.baseEmissive || 0) + 4 * f;
+        v.phasing = true;
+      } else if (v.phasing) {
+        for (const m of v.mats) m.emissiveIntensity = m.userData.baseEmissive || 0;
+        v.phasing = false;
+      }
+      if (e.surgeT > 0 && Math.random() < dt * 25 && !this.fxBusy) {
+        this.sparkBurst(v.root.position.x, 0.15, v.root.position.z, e.def.color, 3, 2, { life: 0.4, size: 0.04, up: 0.2, grav: -2 });
+      }
+      if (v.packet) {
+        v.packet.visible = e.carrying;
+        if (e.carrying) {
+          v.packet.rotation.y += dt * 3;
+          v.packet.rotation.x += dt * 1.3;
+          v.packet.position.y = v.height + 0.28 + Math.sin(this.time * 5 + e.id) * 0.04;
+        }
+      }
+      if (v.jamDisc) {
+        // The field is down while the jammer is stunned.
+        const live = e.stunT <= 0;
+        v.jamDisc.visible = live;
+        v.jamDisc.position.y = 0.13 - v.root.position.y;
+        v.jamDisc.material.opacity = 0.12 + 0.05 * Math.sin(this.time * 7 + e.id);
+        v.jamPulse -= dt;
+        if (live && v.jamPulse <= 0) {
+          v.jamPulse = 1.3;
+          this.shockwave(v.root.position.x, v.root.position.z, 0.3, e.def.jam.radius, e.def.color, 1.0, 0.45);
+        }
       }
       if (e.stunT > 0 && Math.random() < dt * 20) {
         this.enemyCenter(v, tmpV);
@@ -1244,6 +1451,32 @@ export class Renderer3D {
     }
   }
 
+  // Dropped data packets drifting back to the core along the road.
+  syncPackets(game, dt) {
+    const seen = new Set();
+    for (const pk of game.packets) {
+      seen.add(pk.id);
+      let m = this.packetViews.get(pk.id);
+      if (!m) {
+        m = new THREE.Group();
+        m.add(new THREE.Mesh(this.packetGeo, this.packetMat));
+        const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, color: col('#3dffc5').clone().multiplyScalar(1.1), blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+        glow.scale.setScalar(0.55);
+        m.add(glow);
+        m.scale.setScalar(1.3);
+        this.dynGroup.add(m);
+        this.packetViews.set(pk.id, m);
+      }
+      m.position.set(wx(pk.x), 0.45 + Math.sin(this.time * 4 + pk.id) * 0.06, wz(pk.y));
+      m.children[0].rotation.y += dt * 2.5;
+      m.children[0].rotation.x += dt;
+      if (Math.random() < dt * 8 && !this.fxBusy) this.sparkBurst(m.position.x, m.position.y, m.position.z, '#3dffc5', 1, 0.8, { life: 0.5, size: 0.03, grav: 0.5, up: 0.5 });
+    }
+    for (const [id, m] of this.packetViews) {
+      if (!seen.has(id)) { this.dynGroup.remove(m); this.packetViews.delete(id); }
+    }
+  }
+
   // -------------------------------------------------------------------------------- effects
   addFx(obj, life, update, end) {
     this.dynGroup.add(obj);
@@ -1284,6 +1517,42 @@ export class Renderer3D {
       if (dissolve) u.uCut.value = -0.15 + (1 - k) * 1.25;
     });
     return m;
+  }
+
+  // Rotary cannon round: a white-hot tracer streaking from the barrel currently at the firing position (the cluster
+  // spins, so shots walk around the ring), a spray of heat from the side vents, and a spark where it lands.
+  tracer(tv, to, color) {
+    tv.lastShot = this.time;
+    tv.recoil = Math.max(tv.recoil, 0.25 + Math.random() * 0.2); // vibration rather than a single kick
+    const b = tv.barrels;
+    b.updateWorldMatrix(true, false);
+    const a = (tv.shotN = (tv.shotN || 0) + 1) * (Math.PI / 3) + b.rotation.z;
+    const from = new THREE.Vector3(Math.cos(a) * 0.09, Math.sin(a) * 0.09, 0.86).applyMatrix4(b.matrixWorld);
+    const dir = tmpV.copy(to).sub(from);
+    const dist = dir.length();
+    dir.normalize();
+    // A little spray, like any rotary gun.
+    dir.x += (Math.random() - 0.5) * 0.03; dir.y += (Math.random() - 0.5) * 0.02; dir.z += (Math.random() - 0.5) * 0.03;
+    dir.normalize();
+    const speed = 20;
+    RAMP_A.copy(col(color)).lerp(WHITE, 0.75).multiplyScalar(5);
+    RAMP_B.copy(col(color)).multiplyScalar(2.2);
+    this.sparks.add(from.x, from.y, from.z, {
+      vel: [dir.x * speed, dir.y * speed, dir.z * speed], color: RAMP_A, end: RAMP_B,
+      size: 0.055, endSize: 0.05, life: Math.max(0.05, dist / speed), stretch: 0.32, drag: 0, grav: 0,
+    });
+    if (Math.random() < 0.45) this.flare(from.x, from.y, from.z, color, 0.35, 0.05, 2.5);
+    if (Math.random() < 0.35) this.sparkBurst(to.x, to.y, to.z, color, 3, 2.5, { life: 0.2, size: 0.025, grav: -4 });
+    if (Math.random() < 0.2 && !this.fxBusy) {
+      // Heat vented sideways out of the housing.
+      const head = tv.head;
+      const side = tmpV2.set(Math.cos(head.rotation.y), 0, -Math.sin(head.rotation.y)).multiplyScalar(0.25 * tv.size);
+      const p = tv.root.position;
+      this.sparks.add(p.x + side.x, tv.topY * 0.85, p.z + side.z, {
+        vel: [side.x * 6 + (Math.random() - 0.5), 1 + Math.random() * 1.2, side.z * 6 + (Math.random() - 0.5)],
+        color: EMBER_HOT, end: EMBER_COOL, size: 0.03, endSize: 0.02, life: 0.5, grav: -6, drag: 1.5, stretch: 0.4,
+      });
+    }
   }
 
   // Optional eye-candy yields when many effects are alive (keeps 3x-speed hordes smooth).
@@ -1435,7 +1704,7 @@ export class Renderer3D {
           const tv = this.towerViews.get(ev.tower?.id);
           if (!tv) break;
           const from = this.muzzleWorld(tv, new THREE.Vector3());
-          tv.recoil = 1;
+          if (!tv.barrels) tv.recoil = 1; // rotary cannons vibrate instead (see tracer)
           let to;
           if (ev.shard) {
             const ev2 = ev.target && this.enemyViews.get(ev.target.id);
@@ -1477,6 +1746,10 @@ export class Renderer3D {
               }
             }
             this.sparkBurst(to.x, to.y, to.z, ev.color, 8, 3.5, { life: 0.4, size: 0.04 });
+          } else if (tv.barrels) {
+            const ev2 = ev.target && this.enemyViews.get(ev.target.id);
+            to = ev2 ? this.enemyCenter(ev2, new THREE.Vector3()) : new THREE.Vector3(wx(ev.x2), 0.4, wz(ev.y2));
+            this.tracer(tv, to, ev.color);
           } else {
             const ev2 = ev.target && this.enemyViews.get(ev.target.id);
             to = ev2 ? this.enemyCenter(ev2, new THREE.Vector3()) : new THREE.Vector3(wx(ev.x2), 0.4, wz(ev.y2));
@@ -1638,11 +1911,102 @@ export class Renderer3D {
           const v = this.enemyViews.get(ev.enemy.id);
           if (v) { this.dynGroup.remove(v.root); this.enemyViews.delete(ev.enemy.id); }
           this.coreHit = 1;
+          if (ev.escape) {
+            // A courier got out: the breach portal flares.
+            const pt = this.portals[ev.enemy.pathIdx];
+            if (pt) {
+              const p = pt.holder.position;
+              this.flare(p.x, 1, p.z, '#3dffc5', 2.2, 0.4, 3);
+              this.sparkBurst(p.x, 0.8, p.z, '#3dffc5', 24, 4, { life: 0.7, size: 0.04, up: 0.6 });
+            }
+          }
           break;
         }
         case 'text':
+          if (!this.settings.texts && !ev.important) break;
           this.texts.push({ x: wx(ev.x), y: 0.9, z: wz(ev.y), text: ev.text, color: ev.color, size: ev.size, life: 1.1 });
           break;
+        case 'reaction': {
+          const v = ev.enemy && this.enemyViews.get(ev.enemy.id);
+          const c = v ? this.enemyCenter(v, new THREE.Vector3()) : new THREE.Vector3(wx(ev.x), 0.5, wz(ev.y));
+          if (ev.kind === 'thermal') {
+            // Steam burst: fire and ice cancelling out.
+            this.flare(c.x, c.y, c.z, '#fff1dc', 1.3, 0.2, 3);
+            this.sparkBurst(c.x, c.y, c.z, '#ffb070', 14, 4, { life: 0.5, size: 0.04, up: 0.5 });
+            this.smokePuff(c.x, c.y, c.z, 5, { size: 0.3, grow: 2.8, spread: 0.2, rise: 0.9, life: 1.2, alpha: 0.4, tint: '#e8eef5' });
+          } else if (ev.kind === 'superconduct') {
+            this.flare(c.x, c.y, c.z, '#bff4ff', 0.9, 0.14, 3);
+            this.sparkBurst(c.x, c.y, c.z, '#9fe8ff', 6, 3, { life: 0.3, size: 0.03, grav: 0 });
+          } else if (ev.kind === 'overload') {
+            this.explosion(c.x, c.y, c.z, '#ffd23c', 0.45);
+          } else if (ev.kind === 'exposed') {
+            this.flare(c.x, c.y, c.z, '#ff3355', 1.1, 0.16, 3);
+            this.sparkBurst(c.x, c.y, c.z, '#ffffff', 8, 4.5, { life: 0.3, size: 0.035, up: 0.3 });
+          } else if (ev.kind === 'fracture') {
+            this.flipbook(c, 'burst', 1.2, 0.35, '#bfe3ff', 3, true);
+            this.sparkBurst(c.x, c.y, c.z, '#e6f6ff', 16, 4, { life: 0.6, size: 0.04, grav: -10, heat: 0.7 });
+          }
+          break;
+        }
+        case 'rankup': {
+          const tv = this.towerViews.get(ev.tower.id);
+          if (!tv) break;
+          const p = tv.root.position;
+          this.sparkBurst(p.x, tv.topY, p.z, '#ffe600', 10 + ev.rank * 3, 2.5, { up: 1, life: 0.8, size: 0.035, grav: -2 });
+          this.flare(p.x, tv.topY + 0.2, p.z, '#ffe600', 0.9, 0.3, 2);
+          break;
+        }
+        case 'jam': {
+          const tv = this.towerViews.get(ev.tower.id);
+          if (!tv) break;
+          const p = tv.root.position, c = ev.kind === 'hijack' ? '#ffe600' : '#ff2a6a';
+          this.sparkBurst(p.x, tv.topY, p.z, c, 12, 3, { life: 0.35, size: 0.03, grav: -3 });
+          this.flare(p.x, tv.topY, p.z, c, 0.8, 0.18, 2);
+          break;
+        }
+        case 'bossphase': {
+          const v = this.enemyViews.get(ev.enemy.id);
+          if (!v) break;
+          const c = this.enemyCenter(v, new THREE.Vector3());
+          const color = ev.enemy.type === 'titan' ? '#ff2bd6' : '#ffe600';
+          const r = ev.enemy.type === 'titan' ? 3.2 : 1.8;
+          const sph = new THREE.Mesh(this.sphereGeo, this.shieldMatBase.clone());
+          sph.material.uniforms.color.value = col(color);
+          sph.position.set(c.x, 0, c.z);
+          this.addFx(sph, 0.7, (k) => { sph.scale.setScalar(r * (1.05 - k)); sph.material.uniforms.opacity.value = k * 1.5; });
+          this.shockwave(c.x, c.z, 0.4, r, color, 0.8, 1, 0.1);
+          this.flare(c.x, c.y, c.z, color, 3.5, 0.4, 3);
+          this.flashLight(c.x, c.y, c.z, color, 30, 8, 0.5);
+          this.sparkBurst(c.x, c.y, c.z, color, 40, 6, { life: 0.8, size: 0.05, up: 0.5 });
+          this.shakeT = Math.max(this.shakeT, 0.7);
+          break;
+        }
+        case 'hijack': {
+          const v = this.enemyViews.get(ev.enemy.id), tv = this.towerViews.get(ev.tower.id);
+          if (!v || !tv) break;
+          const a = this.enemyCenter(v, new THREE.Vector3());
+          const b = tv.root.position.clone().add(tmpV2.set(0, tv.topY, 0));
+          this.lightning([a, b], '#ffe600', 0.7, { width: 3.5 });
+          break;
+        }
+        case 'steal': {
+          const c = this.core.position;
+          this.flare(c.x, 1.6, c.z, '#3dffc5', 1.8, 0.35, 3);
+          this.sparkBurst(c.x, 1.4, c.z, '#3dffc5', 20, 3.5, { life: 0.6, size: 0.04, up: 0.8 });
+          break;
+        }
+        case 'drop': case 'grab': {
+          const p = ev.packet;
+          this.flare(wx(p.x), 0.5, wz(p.y), '#3dffc5', 1.2, 0.25, 3);
+          this.sparkBurst(wx(p.x), 0.5, wz(p.y), '#3dffc5', 12, 3, { life: 0.5, size: 0.035, up: 0.6 });
+          break;
+        }
+        case 'recover': {
+          const c = this.core.position;
+          this.flare(c.x, 1.6, c.z, '#39ff14', 1.6, 0.35, 3);
+          this.shockwave(c.x, c.z, 0.2, 1.4, '#3dffc5', 0.6, 0.8);
+          break;
+        }
         case 'emp': {
           const r = ev.r / TILE, x = wx(ev.x), z = wz(ev.y);
           const sph = new THREE.Mesh(this.sphereGeo, this.shieldMatBase.clone());
@@ -1730,6 +2094,7 @@ export class Renderer3D {
     this.syncTowers(game, simDt, ui);
     this.syncEnemies(game, simDt);
     this.syncShells(game);
+    this.syncPackets(game, simDt);
     this.updateFx(simDt);
     this.sparks.update(simDt);
     this.smoke.update(simDt);
@@ -1767,10 +2132,13 @@ export class Renderer3D {
 
     this.updateCursor(game, ui);
 
-    // Camera shake.
-    this.updateCamera(realDt);
-    this.controls.update();
-    const shake = Math.max(game.shake * 0.012, this.shakeT * 0.35);
+    // Camera (boss intros take it over), then shake.
+    if (this.cine) this.updateCinematic(realDt);
+    else {
+      this.updateCamera(realDt);
+      this.controls.update();
+    }
+    const shake = Math.max(game.shake * 0.012, this.shakeT * 0.35) * this.settings.shake;
     this.shakeT = Math.max(0, this.shakeT - realDt * 1.5);
     const base = this.camera.position.clone();
     if (shake > 0.001) this.camera.position.add(tmpV.set((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake));
@@ -1849,6 +2217,40 @@ export class Renderer3D {
     this.sightFill.visible = this.sightLine.visible = true;
   }
 
+  // Heat map for placing `type`: recolored only when the tower layout (or, for uplinks, tower levels) changes.
+  updateHeat(game, type) {
+    const key = `${type}|${game.towers.map((t) => (type === 'uplink' ? `${t.id}:${t.level}` : t.id)).join(',')}`;
+    if (key !== this.heat.key) {
+      const data = coverageMap(game, type);
+      let max = 0;
+      for (const v of data) if (v > max) max = v;
+      this.heat = { key, data, max: max || 1, type };
+      const c = new THREE.Color();
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (v < 0) c.setRGB(0, 0, 0); // can't build here: additive black is invisible
+        else {
+          // Red (little road in view) through amber to green (the most road on the map), dimmer when poor.
+          // Poor spots fade almost to nothing so the good ones read at a glance.
+          const k = v / this.heat.max;
+          if (k < 0.5) c.setRGB(1, 0.1 + k * 1.4, 0.06);
+          else c.setRGB(1 - (k - 0.5) * 1.7, 0.8 + (k - 0.5) * 0.3, 0.1 + (k - 0.5) * 0.5);
+          c.multiplyScalar(0.03 + 0.5 * k ** 1.6);
+        }
+        this.heatMesh.setColorAt(i, c);
+      }
+      this.heatMesh.instanceColor.needsUpdate = true;
+    }
+    this.heatMesh.visible = true;
+  }
+
+  // Coverage (tiles of road in view) for a tower anchored at (tx, ty), from the current heat map.
+  heatAt(type, tx, ty) {
+    if (this.heat.type !== type || !this.heat.data || tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return null;
+    const v = this.heat.data[ty * COLS + tx];
+    return v < 0 ? null : { v, k: v / this.heat.max };
+  }
+
   updateCursor(game, ui) {
     const se = ui.selectedEnemy;
     const sv = se && this.enemyViews.get(se.id);
@@ -1863,6 +2265,8 @@ export class Renderer3D {
     this.rangeRing.visible = false;
     this.sightFill.visible = this.sightLine.visible = false;
     this.reticle.visible = false;
+    this.heatMesh.visible = false;
+    if (ui.placing && this.settings.heatmap) this.updateHeat(game, ui.placing);
     if (this.ghosts) for (const g of Object.values(this.ghosts)) g.visible = false;
     const sel = ui.selected;
     if (sel) this.showSight(wx(sel.x), wz(sel.y), sel.range / TILE, sel.def.color, !sel.ignoresWalls);
@@ -1906,6 +2310,7 @@ export class Renderer3D {
   drawOverlay(game, ui, dt) {
     const g = this.octx;
     g.clearRect(0, 0, this.width, this.height);
+    if (this.cinematic) { this.texts.length = 0; return; } // clean frame for boss intros
     // Cloaked enemies: violet marker so the player knows something is there.
     for (const e of game.enemies) {
       if (e.revealed) continue;
@@ -1919,6 +2324,79 @@ export class Renderer3D {
       g.beginPath();
       g.moveTo(p.sx, p.sy - s); g.lineTo(p.sx + s, p.sy); g.lineTo(p.sx, p.sy + s); g.lineTo(p.sx - s, p.sy); g.closePath();
       g.stroke();
+    }
+    // Variant badges: one small lettered chip per variant (M = mirror-plated, I = insulated, ...).
+    g.textAlign = 'center';
+    g.font = '700 9px "Share Tech Mono", monospace';
+    for (const e of game.enemies) {
+      if (!e.mods.length || !e.revealed) continue;
+      const v = this.enemyViews.get(e.id);
+      if (!v) continue;
+      const p = this.project(v.root.position.x, v.root.position.y + v.height + 0.05, v.root.position.z);
+      if (p.behind) continue;
+      e.mods.forEach((m, i) => {
+        const x = p.sx + (i - (e.mods.length - 1) / 2) * 13, y = p.sy - 12;
+        g.fillStyle = 'rgba(8,5,18,0.8)';
+        g.fillRect(x - 5.5, y - 6, 11, 11);
+        g.strokeStyle = MODS[m].color;
+        g.lineWidth = 1;
+        g.strokeRect(x - 5.5, y - 6, 11, 11);
+        g.fillStyle = MODS[m].color;
+        g.fillText(MODS[m].glyph, x, y + 3);
+      });
+    }
+    // Couriers running out with a packet: teal diamond so they stand out in a crowd.
+    for (const e of game.enemies) {
+      if (!e.carrying || !e.revealed) continue;
+      const v = this.enemyViews.get(e.id);
+      if (!v) continue;
+      const p = this.project(v.root.position.x, v.root.position.y + v.height + 0.55, v.root.position.z);
+      if (p.behind) continue;
+      const s = 6 + Math.sin(this.time * 8 + e.id) * 1.5;
+      g.strokeStyle = 'rgba(61,255,197,0.95)';
+      g.lineWidth = 2;
+      g.beginPath();
+      g.moveTo(p.sx, p.sy - s); g.lineTo(p.sx + s, p.sy); g.lineTo(p.sx, p.sy + s); g.lineTo(p.sx - s, p.sy); g.closePath();
+      g.stroke();
+    }
+    // Offline towers: a warning tag with the time left on longer outages (EMP vents, hijacks).
+    g.textAlign = 'center';
+    for (const t of game.towers) {
+      if (!(t.jamT > 0)) continue;
+      const tv = this.towerViews.get(t.id);
+      if (!tv) continue;
+      const p = this.project(tv.root.position.x, tv.topY + 0.35, tv.root.position.z);
+      if (p.behind) continue;
+      const hijack = t.jamKind === 'hijack';
+      const label = hijack ? 'HIJACKED' : t.jamKind === 'emp' ? 'EMP' : 'JAMMED';
+      const text = t.jamT > 0.5 ? `${label} ${t.jamT.toFixed(1)}` : label;
+      g.font = '700 10px "Share Tech Mono", monospace';
+      const tw = g.measureText(text).width + 8;
+      g.fillStyle = 'rgba(10,4,14,0.8)';
+      g.fillRect(p.sx - tw / 2, p.sy - 8, tw, 13);
+      g.fillStyle = hijack ? '#ffe600' : '#ff4f86';
+      g.globalAlpha = 0.75 + 0.25 * Math.sin(this.time * 14);
+      g.fillText(text, p.sx, p.sy + 2);
+      g.globalAlpha = 1;
+    }
+    // Veterancy chevrons over the inspected tower.
+    const sel = ui.selected;
+    if (sel && sel.rank > 0) {
+      const tv = this.towerViews.get(sel.id);
+      if (tv) {
+        const p = this.project(tv.root.position.x, tv.topY + 0.2, tv.root.position.z);
+        if (!p.behind) {
+          g.strokeStyle = '#ffe600';
+          g.lineWidth = 2;
+          g.shadowColor = '#ffe600';
+          g.shadowBlur = 6;
+          for (let i = 0; i < sel.rank; i++) {
+            const y = p.sy - 18 - i * 5;
+            g.beginPath(); g.moveTo(p.sx - 7, y + 4); g.lineTo(p.sx, y); g.lineTo(p.sx + 7, y + 4); g.stroke();
+          }
+          g.shadowBlur = 0;
+        }
+      }
     }
     // Marked targets (Railgun targeting path): red reticle.
     for (const e of game.enemies) {
@@ -1951,8 +2429,15 @@ export class Renderer3D {
       g.fillStyle = 'rgba(0,0,0,0.75)';
       g.fillRect(x - 1, y - 1, w + 2, 5);
       const k = Math.max(0, e.hp / e.maxHp);
-      g.fillStyle = k > 0.5 ? '#39ff14' : k > 0.25 ? '#ffe600' : '#ff3355';
+      g.fillStyle = e.phaseT > 0 ? '#ffffff' : k > 0.5 ? '#39ff14' : k > 0.25 ? '#ffe600' : '#ff3355';
       g.fillRect(x, y, w * k, 3);
+      // Skull thresholds: bright until passed.
+      if (e.def.phases) {
+        e.def.phases.forEach((f, i) => {
+          g.fillStyle = i < e.phase ? 'rgba(255,255,255,0.25)' : '#ffffff';
+          g.fillRect(x + w * f - 1, y - 2, 2, 7);
+        });
+      }
       if (e.maxShield) {
         g.fillStyle = 'rgba(0,0,0,0.75)';
         g.fillRect(x - 1, y - 5, w + 2, 4);

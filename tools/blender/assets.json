@@ -295,7 +295,10 @@
       "vmin": 0.5,
       "strength": 4
     },
-    "decimate": 16000
+    "decimate": 16000,
+    "barrels": {
+      "cut_y": -0.43
+    }
   },
   "tower_plasma_t5": {
     "src": "concept/raw/tower_plasma_t5.glb",

@@ -1,4 +1,4 @@
-import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, TILE, W, H, computeStats } from './config.js';
+import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, MODS, VET, REACTIONS, TILE, W, H, computeStats, endlessMutators } from './config.js';
 import { Game, footprintAnchor, coreDamage } from './game.js';
 import { Renderer } from './render.js';
 import { Renderer3D } from './render3d.js';
@@ -31,16 +31,31 @@ let save = { maps: {} };
 try { save = { maps: {}, ...JSON.parse(localStorage.getItem(SAVE_KEY) || '{}') }; } catch { /* fresh save */ }
 const persist = () => { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch { /* storage blocked */ } };
 
+// Gameplay & display settings (audio levels live in the AudioManager).
+const SETTINGS_KEY = 'neonbreach.settings';
+const settings = { autoStart: false, intros: true, heatmap: true, shake: 1, crt: true, texts: true };
+try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch { /* defaults */ }
+function applySettings() {
+  Object.assign(r3d.settings, { shake: settings.shake, texts: settings.texts, heatmap: settings.heatmap });
+  document.querySelector('.crt')?.classList.toggle('off', !settings.crt);
+  $('#btn-auto')?.classList.toggle('on', settings.autoStart);
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* storage blocked */ }
+}
+
 let game = null;
 let screen = 'title';
 let speed = 1;
 let paused = false;
 let modalOpen = false;
+let autoT = 0; // countdown to an auto-launched wave
+let introWave = 0; // last wave whose boss got an intro
+let pendingIntro = null; // boss waiting to clear its spawn portal before the intro starts
 const ui = { hover: null, placing: null, selected: null, selectedEnemy: null, ability: null, shift: false, previewPath: null };
 
 // ---------------------------------------------------------------- screens
 function show(name) {
   screen = name;
+  if (name !== 'game') { $('#comms').classList.remove('show'); $('#cine').classList.remove('show'); }
   document.querySelectorAll('.screen').forEach((s) => s.classList.toggle('active', s.id === `screen-${name}`));
   $('#bgfx').style.display = name === 'game' ? 'none' : 'block';
   if (name !== 'game') audio.playMusic('menu');
@@ -62,7 +77,7 @@ document.addEventListener('click', (ev) => {
   if (a === 'play') show('levels');
   else if (a === 'back') show('title');
   else if (a === 'howto') showHowTo();
-  else if (a === 'audio') showAudioSettings();
+  else if (a === 'settings') showSettings();
 });
 // Keep keyboard shortcuts (Space especially) from re-triggering whichever button was clicked last.
 document.addEventListener('pointerup', () => {
@@ -116,29 +131,61 @@ async function startGame(mapIndex) {
     toast('LOADING 3D ASSETS…', '#00f0ff');
     await assetsReady;
   }
+  let briefed = false; // a new-threat or variant line already covers this wave's callout
   const g = new Game(mapIndex, {
-    sfx: (name, src) => audio.play(name, src),
+    // A tier-5 Overdrive laser (Photon Storm) is a rotary cannon: it rattles instead of zapping.
+    sfx: (name, src) => audio.play(name === 'laser' && src?.tiers?.[0] === 5 ? 'gatling' : name, src),
     message: (text, kind) => toast(text, kind === 'bonus' ? '#ffe600' : '#00f0ff'),
-    newThreat: (type) => threatCard(type),
+    newThreat: (type) => {
+      threatCard(type);
+      if (!ENEMIES[type].boss) { audio.say(`threat_${type}`); briefed = true; }
+    },
+    newVariant: (mod) => {
+      variantCard(mod);
+      audio.say(MODS[mod].voice || 'mutators');
+      briefed = true;
+    },
     waveStart: (n, boss) => {
       banner(boss ? `WAVE ${n}` : `WAVE ${n}`, boss ? 'BOSS SIGNATURE DETECTED' : 'HOSTILES INBOUND', boss);
       audio.play(boss ? 'boss_warning' : 'wave_start');
+      if (!boss && !briefed && Math.random() < 0.4) audio.say(`wave_start_${1 + Math.floor(Math.random() * 3)}`);
+      briefed = false;
       buildNextWave();
     },
     waveClear: (n, bonus) => {
       toast(`WAVE ${n} NEUTRALIZED  +${bonus}¢`, '#39ff14');
       audio.play('wave_clear');
+      if (Math.random() < 0.3) audio.say(`wave_clear_${1 + Math.floor(Math.random() * 2)}`);
     },
     leak: () => {
-      if (game.lives > 0 && game.lives <= game.maxLives * 0.25) toast('⚠ CORE INTEGRITY CRITICAL', '#ff3355');
+      if (game.lives > 0 && game.lives <= game.maxLives * 0.25) { toast('⚠ CORE INTEGRITY CRITICAL', '#ff3355'); audio.say('core_critical'); }
     },
-    end: (won) => setTimeout(() => { if (game === g) endScreen(won); }, won ? 900 : 1400),
+    bossSpawn: (e) => {
+      if (game === g && settings.intros && !g.endless && introWave !== g.wave) { introWave = g.wave; pendingIntro = e; }
+    },
+    bossPhase: (e, n) => {
+      toast(`☠\uFE0E ${e.def.name} // ${e.def.phaseName} ${n}/${e.def.phases.length}`, e.def.color, 3200);
+      audio.say(e.type === 'titan' ? 'phase_titan' : 'phase_overmind');
+    },
+    steal: () => { toast('⚠ DATA PACKET STOLEN — STOP THE COURIER', '#3dffc5'); audio.say('data_stolen'); },
+    escape: (e) => { toast(`DATA PACKET LOST  −${e.def.courier.packet} INTEGRITY`, '#ff3355'); audio.say('data_escaped'); },
+    recover: () => { toast('DATA PACKET RECOVERED', '#39ff14', 1800); audio.say('data_recovered'); },
+    jammed: () => audio.say('jammed'),
+    rankUp: (t) => { if (t.rank >= 3) toast(`${towerTitle(t)} PROMOTED // RANK ${VET.numerals[t.rank]} ${VET.names[t.rank]}`, '#ffe600', 2200); },
+    end: (won) => {
+      audio.say(won ? 'victory' : 'defeat');
+      setTimeout(() => { if (game === g) endScreen(won); }, won ? 900 : 1400);
+    },
   });
   game = g;
   ui.placing = null;
   ui.selected = null;
   ui.ability = null;
   paused = false;
+  autoT = 0;
+  introWave = 0;
+  pendingIntro = null;
+  audio.clearVoice();
   setSpeed(1);
   $('#hud-maxlives').textContent = game.maxLives;
   $('#toasts').innerHTML = '';
@@ -152,6 +199,39 @@ async function startGame(mapIndex) {
   renderInfo(true);
   audio.playMusic('battle');
   toast(`${game.map.name} // PLACE DEFENSES, THEN LAUNCH WAVE`, game.map.theme.accent);
+  if (!save.briefed) { save.briefed = true; persist(); audio.say('start'); }
+  updateBossBars(true);
+}
+
+// Boss intro: once the boss has stepped out of its portal, the camera flies to it while a name card shows and the
+// simulation runs in slow motion.
+function checkIntro() {
+  const e = pendingIntro;
+  if (!e) return;
+  if (e.dead || game.state === 'lost') { pendingIntro = null; return; }
+  if (e.dist < 1.4 * TILE) return;
+  pendingIntro = null;
+  bossIntro(e);
+}
+
+function bossIntro(e) {
+  const d = e.def;
+  const cine = $('#cine');
+  cine.style.setProperty('--c', d.color);
+  $('#cc-name').textContent = d.name;
+  $('#cc-desc').textContent = d.desc;
+  $('#cc-phase').innerHTML = `${'☠\uFE0E '.repeat(d.phases.length)}<b>${d.phaseName}</b><br>${d.phaseDesc}`;
+  ui.placing = null;
+  ui.ability = null;
+  r3d.startCinematic(e);
+  cine.classList.add('show');
+  audio.say(e.type === 'titan' ? 'boss_titan' : 'boss_overmind');
+}
+
+function skipIntro() {
+  if (!r3d.cinematic) return false;
+  r3d.skipCinematic();
+  return true;
 }
 
 function recordProgress(won) {
@@ -181,13 +261,72 @@ function endScreen(won) {
       <div><b>${game.stats.kills}</b>KILLS</div>
       <div><b>${game.lives}</b>INTEGRITY</div>
       <div><b>${game.stats.earned}</b>¢ EARNED</div>
-    </div>`;
+    </div>
+    ${damageReport()}`;
   const buttons = [
     { label: 'LEVEL SELECT', action: () => { closeModal(); show('levels'); } },
     { label: 'RETRY', action: () => { closeModal(); startGame(game.mapIndex); } },
   ];
-  if (won) buttons.push({ label: 'ENDLESS MODE ▶', primary: true, action: () => { closeModal(); game.continueEndless(); toast('ENDLESS MODE // SURVIVE AS LONG AS YOU CAN', '#ff2bd6'); buildNextWave(); } });
+  if (won) buttons.push({ label: 'ENDLESS MODE ▶', primary: true, action: () => { closeModal(); game.continueEndless(); toast('ENDLESS MODE // SURVIVE AS LONG AS YOU CAN', '#ff2bd6'); audio.say('endless'); buildNextWave(); } });
   openModal(won ? 'CORE SECURED' : 'SYSTEM BREACHED', body, buttons, won ? 'win' : 'lose');
+}
+
+const fmtNum = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(Math.round(n)));
+const chevrons = (rank) => '›'.repeat(rank);
+// A tower's display name: its capstone once a path reaches tier 5.
+const towerTitle = (t) => (Math.max(...t.tiers) === 5 ? t.def.paths[t.tiers.indexOf(5)].tiers[4].name : t.def.name);
+
+// End-of-run breakdown: every tower that did damage (sold ones included), plus combos and data couriers.
+function damageReport() {
+  const rows = [...game.towers.map((t) => ({ type: t.type, tiers: t.tiers, rank: t.rank, dmg: t.dmgDealt, kills: t.kills, def: t.def })),
+    ...game.retired.map((r) => ({ ...r, def: TOWERS[r.type] }))]
+    .filter((r) => r.dmg > 0 || r.kills > 0).sort((a, b) => b.dmg - a.dmg);
+  if (!rows.length) return '';
+  const total = rows.reduce((a, r) => a + r.dmg, 0) || 1;
+  const top = rows.slice(0, 8);
+  const html = top.map((r, i) => {
+    const title = Math.max(...r.tiers) === 5 ? r.def.paths[r.tiers.indexOf(5)].tiers[4].name : r.def.name;
+    return `<div class="rep-row${r.sold ? ' sold' : ''}" style="--c:${r.def.color}">
+      <img src="${towerIcon(r.type)}" alt="">
+      <div class="rep-name">${title}${i === 0 ? '<span class="mvp">MVP</span>' : ''}<small>${r.tiers.join('-')}${r.rank ? ` · RANK ${VET.numerals[r.rank]}` : ''}${r.sold ? ' · SOLD' : ''}</small></div>
+      <div class="rep-bar"><i style="width:${(r.dmg / top[0].dmg) * 100}%"></i></div>
+      <b>${fmtNum(r.dmg)}<small>${Math.round((r.dmg / total) * 100)}% · ${r.kills} kill${r.kills === 1 ? '' : 's'}</small></b></div>`;
+  }).join('');
+  const st = game.stats;
+  const combos = Object.entries(st.reactions).sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `<span><b style="color:${REACTIONS[k].color}">${REACTIONS[k].name}</b> ×${fmtNum(n)}</span>`).join('');
+  const data = st.stolen ? `<span>DATA PACKETS: ${st.stolen} stolen · ${st.recovered} recovered · <b style="color:${st.escaped ? 'var(--red)' : 'var(--green)'}">${st.escaped} lost</b></span>` : '';
+  return `<h4>DAMAGE REPORT</h4><div class="report">${html}</div>
+    ${combos ? `<div class="rep-sum">${combos}</div>` : ''}${data ? `<div class="rep-sum">${data}</div>` : ''}`;
+}
+
+// ---------------------------------------------------------------- boss bars
+let bossKey = '';
+function updateBossBars(force) {
+  const wrap = $('#boss-bars');
+  const bosses = game ? game.enemies.filter((e) => e.def.boss && !e.dead).slice(0, 3) : [];
+  const key = bosses.map((e) => e.id).join(',');
+  if (key !== bossKey || force) {
+    bossKey = key;
+    wrap.innerHTML = bosses.map((e) => `<div class="boss-bar" data-id="${e.id}" style="--c:${e.def.color}">
+      <div class="bb-head"><span>${e.def.name}</span><small class="bb-skulls"></small></div>
+      <div class="bb-track"><div class="bb-fill"></div>${e.def.phases.map((f) => `<i style="left:${f * 100}%"></i>`).join('')}</div>
+      ${e.maxShield ? '<div class="bb-shield"><div></div></div>' : ''}</div>`).join('');
+  }
+  bosses.forEach((e, i) => {
+    const el = wrap.children[i];
+    if (!el) return;
+    const fill = el.querySelector('.bb-fill');
+    fill.style.width = `${Math.max(0, e.hp / e.maxHp) * 100}%`;
+    fill.classList.toggle('phase', e.phaseT > 0);
+    el.querySelectorAll('.bb-track i').forEach((tick, k) => tick.classList.toggle('done', k < e.phase));
+    const skulls = e.def.phases.map((_, k) => `<span class="${k < e.phase ? 'done' : ''}">☠\uFE0E</span>`).join('');
+    const sk = el.querySelector('.bb-skulls');
+    if (sk.dataset.p !== String(e.phase)) { sk.dataset.p = String(e.phase); sk.innerHTML = `${skulls} ${fmtNum(Math.max(0, e.hp))}`; }
+    else sk.lastChild.textContent = ` ${fmtNum(Math.max(0, e.hp))}`;
+    const sh = el.querySelector('.bb-shield div');
+    if (sh) sh.style.width = `${(e.shield / e.maxShield) * 100}%`;
+  });
 }
 
 // ---------------------------------------------------------------- HUD
@@ -214,6 +353,7 @@ function updateHud() {
   if (game.state === 'won' || game.state === 'lost') { label = 'SIMULATION ENDED'; }
   else if (game.campaignDone) { label = 'FINAL WAVE ACTIVE'; }
   else if (game.busy && game.wave > 0) { label = `CALL WAVE ${game.wave + 1} EARLY`; cls = 'early'; }
+  else if (autoT > 0) { label = `AUTO-LAUNCH ${game.wave + 1} IN ${Math.ceil(autoT)}`; cls = 'pulse'; }
   else { label = `LAUNCH WAVE ${game.wave + 1}`; cls = 'pulse'; }
   setText('btn-wave-label', label);
   btn.disabled = game.state === 'won' || game.state === 'lost' || game.campaignDone;
@@ -234,6 +374,20 @@ function updateHud() {
     el.classList.toggle('armed', ui.ability === key || (key === 'overclock' && game.overclockT > 0));
   }
   renderInfo(false);
+  updateBossBars(false);
+  // Placement heat map readout for the hovered spot.
+  const hl = $('#heat-line');
+  if (hl && ui.placing) {
+    const h = ui.hover;
+    const size = TOWERS[ui.placing].size || 1;
+    const a = h && h.tx >= 0 ? footprintAnchor(size, h.x, h.y) : null;
+    const v = a && r3d.heatAt(ui.placing, a.tx, a.ty);
+    const unit = ui.placing === 'uplink' ? 'tower levels in range' : 'tiles of road in view';
+    const html = !settings.heatmap ? 'Heat map off (H)' : v
+      ? `<b style="color:${v.k > 0.66 ? 'var(--green)' : v.k > 0.33 ? 'var(--yellow)' : 'var(--red)'}">${v.v.toFixed(1)}</b> ${unit} · ${Math.round(v.k * 100)}% of the best spot`
+      : 'Heat map: green pads cover the most road';
+    if (hl.dataset.h !== html) { hl.dataset.h = html; hl.innerHTML = html; }
+  }
 }
 
 function buildShop() {
@@ -279,14 +433,28 @@ function buildNextWave() {
     return;
   }
   $('#next-wave-num').textContent = `// ${n}`;
+  // One chip per enemy type and variant combination.
   const counts = new Map();
-  for (const grp of game.waveDef(n)) counts.set(grp.type, (counts.get(grp.type) || 0) + grp.count);
-  for (const [type, count] of counts) {
+  for (const grp of game.waveDef(n)) {
+    const key = `${grp.type}|${(grp.mods || []).join('+')}`;
+    const c = counts.get(key) || { type: grp.type, mods: grp.mods || [], count: 0 };
+    c.count += grp.count;
+    counts.set(key, c);
+  }
+  for (const { type, mods, count } of counts.values()) {
     const def = ENEMIES[type];
     const el = document.createElement('div');
     el.className = `nw-item${def.boss ? ' boss' : ''}`;
-    el.title = `${def.name} — ${def.desc || ''}`;
-    el.innerHTML = `<img src="${enemyIcon(type)}" alt="">×${count}`;
+    el.title = [`${def.name} — ${def.desc || ''}`, ...mods.map((m) => `${MODS[m].name}: ${MODS[m].desc}`)].join('\n');
+    const badges = mods.length ? `<span class="mods">${mods.map((m) => `<span class="mod" style="--vc:${MODS[m].color}">${MODS[m].name}</span>`).join('')}</span>` : '';
+    el.innerHTML = `<img src="${enemyIcon(type)}" alt="">×${count}${badges}`;
+    wrap.appendChild(el);
+  }
+  const muts = endlessMutators(n);
+  if (muts.length) {
+    const el = document.createElement('div');
+    el.className = 'nw-mutators';
+    el.innerHTML = `MUTATORS: ${muts.map((m) => `<b style="color:${MODS[m].color}" title="${MODS[m].desc}">${MODS[m].name}</b>`).join(' · ')}`;
     wrap.appendChild(el);
   }
 }
@@ -331,7 +499,8 @@ const TRAITS = [
   ['STUN', (s) => s.stunChance > 0], ['MARK', (s) => s.markAmp > 0], ['CLUSTER', (s) => s.cluster > 0], ['FIRE', (s) => s.fireZone > 0],
   ['KNOCKBACK', (s) => s.knockback > 0], ['FREEZE', (s) => s.freezeChance > 0 || s.freezeEvery > 0], ['BRITTLE', (s) => s.brittle > 0],
   ['SHARDS', (s) => s.shards > 0], ['SHATTER', (s) => s.shatter > 0], ['BLIZZARD', (s) => s.globalSlow > 0], ['BOSS ×', (s) => s.bossMul > 1],
-  ['GLOBAL', (s) => s.global], ['THROUGH WALLS', (s) => s.xray], ['BURST', (s) => s.burstEvery > 0], ['NO FALLOFF', (s) => s.falloff >= 1 && s.chains > 0],
+  ['GLOBAL', (s) => s.global], ['THROUGH WALLS', (s) => s.xray], ['BURST', (s) => s.burstEvery > 0], ['NO FALLOFF', (s) => s.falloff >= 1 && s.chains > 0], ['FULL PIERCE', (s) => s.slugFalloff === 0],
+  ['FIREWALL', (s) => s.firewall],
   ['ARMOR ↓', (s) => s.auraArmorDown > 0], ['DMG AMP', (s) => s.auraAmp > 0], ['LEECH', (s) => s.auraShieldDrain > 0],
   ['SLOW FIELD', (s) => s.auraSlow > 0], ['BOUNTY', (s) => s.bounty > 0 || s.killBounty > 0], ['AIR', (s) => s.air],
 ];
@@ -366,6 +535,8 @@ const COUNTERS = {
   splitter: 'Bursts into 3 Nano-Mites — keep splash or chain damage behind it.',
   mite: 'Fast and fragile — Tesla chains and Cryo pulses sweep them up.',
   medic: 'Heals everything around it. Kill it first: STRONG/CLOSE targeting or a Railgun line.',
+  jammer: 'Knocks out towers within 1.8 tiles. Out-range it (Railgun, Mortar), stun it (EMP, freezes) to drop the field, or firewall towers with an Uplink on the Intrusion path.',
+  courier: 'Only hurts you if it escapes with a packet: towers near the exit get a second shot. FIRST targeting prioritises carriers about to escape.',
   titan: 'Boss with heavy armor. Railguns, Orbital Strike and EMP (1s stun on bosses).',
   overmind: 'Shielded, armored and launches drones. Tesla for the shield, Railguns for the hull, save the Orbital Strike.',
 };
@@ -376,11 +547,16 @@ function enemyTags(e) {
   if (d.flying) tags.push(['AIR', '#00f0ff']);
   if (d.armor) tags.push([`ARMOR ${d.armor}`, '#ff8a00']);
   if (e.maxShield) tags.push(['SHIELD', '#5aa0ff']);
-  if (d.cloaked) tags.push(['CLOAK', '#a855ff']);
+  if (e.cloaked) tags.push(['CLOAK', '#a855ff']);
   if (d.heal) tags.push(['HEALER', '#39ff14']);
   if (d.splits) tags.push(['SPLITS', '#39ff14']);
   if (d.spawns) tags.push(['SPAWNER', '#ffe600']);
-  return tags.map(([t, c]) => `<span class="tag" style="--c:${c}">${t}</span>`).join('');
+  if (d.jam) tags.push(['JAMMER', d.color]);
+  if (d.courier) tags.push(['THIEF', d.color]);
+  if (d.phases) tags.push([`${d.phases.length} SKULLS`, '#ffffff']);
+  const html = tags.map(([t, c]) => `<span class="tag" style="--c:${c}">${t}</span>`);
+  for (const m of e.mods) html.push(`<span class="tag mod" style="--c:${MODS[m].color}">${MODS[m].name}</span>`);
+  return html.join('');
 }
 
 function enemyPanelHtml(e) {
@@ -400,6 +576,8 @@ function enemyPanelHtml(e) {
       <dt>STATUS</dt><dd id="ei-status"></dd>
     </dl>
     <p>${d.desc || ''}</p>
+    ${e.mods.map((m) => `<div class="variant-line" style="--vc:${MODS[m].color}"><b>${MODS[m].name}</b> ${MODS[m].desc}</div>`).join('')}
+    ${d.phases ? `<div class="variant-line" style="--vc:${d.color}"><b>${d.phaseName}</b> ${d.phaseDesc}</div>` : ''}
     <p class="tip">▸ ${COUNTERS[e.type] || ''}</p>`;
 }
 
@@ -418,18 +596,23 @@ function updateEnemyPanel(e) {
     panel.querySelector('#ei-shv').textContent = `${Math.ceil(e.shield)}/${Math.round(e.maxShield)}`;
   }
   const slow = e.slowT > 0 ? e.slowAmt * (e.def.boss ? 0.5 : 1) : 0;
-  const speed = e.stunT > 0 ? 0 : e.def.speed * (1 - slow);
+  const speed = e.stunT > 0 ? 0 : e.speed * (1 - slow);
   panel.querySelector('#ei-speed').textContent = `${speed.toFixed(2)} tiles/s${slow ? ` (−${Math.round(slow * 100)}%)` : ''}`;
-  panel.querySelector('#ei-dist').textContent = `${Math.max(0, e.remaining / TILE).toFixed(1)} tiles`;
+  panel.querySelector('#ei-dist').textContent = e.carrying ? `${Math.max(0, e.remaining / TILE).toFixed(1)} tiles to the exit` : e.def.courier ? `${Math.max(0, e.remaining / TILE).toFixed(1)} tiles (then runs back out)` : `${Math.max(0, e.remaining / TILE).toFixed(1)} tiles`;
   // Live breach cost: hull + whatever shield layer is still up (+ unspawned Nano-Mites).
   const extra = [];
   if (e.def.shieldLives && e.shield > 0) extra.push('shield');
   if (e.def.splits) extra.push(`${e.def.splits.count} mites`);
   panel.querySelector('#ei-core').textContent = `${coreDamage(e)}${extra.length ? ` (incl. ${extra.join(' + ')})` : ''}`;
   const st = [];
+  if (e.phaseT > 0) st.push('<span style="color:#fff">PHASE SHIFT</span>');
   if (e.stunT > 0) st.push('<span style="color:var(--cyan)">STUNNED</span>');
   if (e.slowT > 0) st.push('<span style="color:#5aa0ff">SLOWED</span>');
-  if (e.def.cloaked) st.push(e.revealed ? '<span style="color:var(--green)">REVEALED</span>' : '<span style="color:#b98cff">CLOAKED</span>');
+  if (e.burnT > 0) st.push('<span style="color:#ff8a00">BURNING</span>');
+  if (e.crackT > 0) st.push('<span style="color:#ffb070">CRACKED</span>');
+  if (e.carrying) st.push('<span style="color:#3dffc5">CARRYING DATA</span>');
+  if (e.def.jam && e.stunT <= 0) st.push(`<span style="color:${e.def.color}">JAMMING</span>`);
+  if (e.cloaked) st.push(e.revealed ? '<span style="color:var(--green)">REVEALED</span>' : '<span style="color:#b98cff">CLOAKED</span>');
   if (e.flash > 0) st.push('<span style="color:var(--red)">UNDER FIRE</span>');
   panel.querySelector('#ei-status').innerHTML = st.join(' · ') || 'NOMINAL';
 }
@@ -465,7 +648,7 @@ function renderInfo(force) {
   const previewType = ui.shopHover || ui.placing;
   const afford = sel ? [0, 1, 2].map((i) => (sel.nextTier(i) && game.credits >= sel.nextTier(i).cost ? 1 : 0)).join('') : '';
   const key = sel
-    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}`
+    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}|${sel.rank}|${sel.fresh}`
     : previewType ? `prev|${previewType}` : 'empty';
   if (key !== infoKey || force) {
     infoKey = key;
@@ -475,20 +658,23 @@ function renderInfo(force) {
       if (ui.previewPath != null && sel.nextTier(ui.previewPath) && sel.canUpgrade(ui.previewPath)) {
         const tiers = [...sel.tiers];
         tiers[ui.previewPath]++;
-        preview = computeStats(def, tiers);
+        preview = computeStats(def, tiers, sel.rank);
       }
-      const title = sel.level === 5 ? def.paths[sel.mainPath].tiers[4].name : def.name;
+      const title = towerTitle(sel);
       const aims = sel.type !== 'uplink' && sel.type !== 'cryo';
+      const sellTip = sel.fresh ? 'Bought this build phase: full refund' : `70% refund${sel.rank ? ` · loses RANK ${VET.numerals[sel.rank]}` : ''}`;
       panel.style.setProperty('--c', def.color);
       panel.innerHTML = `
         <h3>${title}</h3>
         <div class="lvl">${def.name} · PATHS ${sel.tiers.join('-')}</div>
-        <div class="lvl">KILLS <b id="info-kills">${sel.kills}</b> · DEALT <b id="info-dmg">${Math.round(sel.dmgDealt)}</b></div>
+        <div class="lvl">KILLS <b id="info-kills">${sel.kills}</b> · DEALT <b id="info-dmg">${fmtNum(sel.dmgDealt)}</b></div>
+        <div class="rank-row" id="rank-row">${rankRow(sel)}</div>
         ${statRows(def, sel.stats, preview, true)}
+        ${comboChips(sel.type)}
         <div class="paths">${def.paths.map((p, i) => pathCard(sel, p, i)).join('')}</div>
         <div class="actions${aims ? '' : ' one'}">
           ${aims ? `<button class="btn target" id="btn-target" title="Targeting priority (T)"><span>◎ ${MODES.find(([m]) => m === sel.mode)[1]}</span></button>` : ''}
-          <button class="btn sell" id="btn-sell"><span>SELL +${sel.sellValue}¢</span></button>
+          <button class="btn sell" id="btn-sell" title="${sellTip}"><span>SELL +${sel.sellValue}¢${sel.fresh ? ' <i class="fresh">FULL</i>' : ''}</span></button>
         </div>`;
       panel.querySelector('#btn-sell').addEventListener('click', () => doSell());
       panel.querySelector('#btn-target')?.addEventListener('click', () => { cycleTargeting(); renderInfo(true); });
@@ -502,23 +688,52 @@ function renderInfo(force) {
       const def = TOWERS[previewType];
       panel.style.setProperty('--c', def.color);
       panel.innerHTML = `<h3>${def.name}</h3><div class="lvl">${def.cost}¢ · HOTKEY ${TOWER_ORDER.indexOf(previewType) + 1}</div><p>${def.desc}</p>${statRows(def, computeStats(def, [0, 0, 0]))}
-        <div class="path-preview">${def.paths.map((p) => `<span style="color:${p.color}">${p.name}</span>`).join(' · ')}</div>`;
+        ${comboChips(previewType)}
+        <div class="path-preview">${def.paths.map((p) => `<span style="color:${p.color}">${p.name}</span>`).join(' · ')}</div>
+        ${ui.placing ? '<div class="heat-line" id="heat-line"></div>' : ''}`;
     } else {
       panel.style.removeProperty('--c');
       panel.innerHTML = `<div class="panel-title">SYSTEM</div><div class="info-empty">
-        Select a defense (<b>1–6</b>) and click an empty tile to deploy.<br>
+        Select a defense (<b>1–6</b>) and click an empty tile to deploy — the heat map shows where it sees the most road.<br>
         Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget.<br>
         Buildings block line of sight — a tower's range area only covers what it can see.<br>
-        <b>SPACE</b> launches waves — calling early pays a bonus.<br>
-        <b>Q W E</b> abilities · <b>F</b> speed · <b>P</b> pause · <b>RMB/ESC</b> cancel.<br>
+        <b>SPACE</b> launches waves — calling early pays a bonus · <b>A</b> auto-launch.<br>
+        <b>Q W E</b> abilities · <b>F</b> speed (up to 4×) · <b>H</b> heat map · <b>P</b> pause · <b>RMB/ESC</b> cancel.<br>
         Camera: <b>RMB drag</b>/<b>arrows</b> pan · <b>wheel</b> zoom · <b>MMB</b>/<b>Z X</b> turn · <b>C</b> reset.</div>`;
     }
   } else if (sel) {
     const k = panel.querySelector('#info-kills');
     const d = panel.querySelector('#info-dmg');
+    const r = panel.querySelector('#rank-row');
     if (k) k.textContent = sel.kills;
-    if (d) d.textContent = Math.round(sel.dmgDealt);
+    if (d) d.textContent = fmtNum(sel.dmgDealt);
+    if (r) { const html = rankRow(sel); if (r.dataset.h !== html) { r.dataset.h = html; r.innerHTML = html; } }
   }
+}
+
+// Veterancy readout: chevrons, rank name and progress to the next rank.
+function rankRow(t) {
+  const next = VET.xp[t.rank];
+  const prev = t.rank ? VET.xp[t.rank - 1] : 0;
+  const k = next ? Math.min(1, (t.xp - prev) / (next - prev)) : 1;
+  const bonus = t.rank ? ` +${Math.round(VET.dmg * t.rank * 100)}% DMG` : '';
+  return `<span class="chev">${t.rank ? chevrons(t.rank) : '·'}</span><div class="xpbar"><div style="width:${Math.round(k * 100)}%"></div></div>
+    <span>${t.rank ? `${VET.names[t.rank]}` : 'RECRUIT'}<small>${bonus}${next ? ` · ${Math.floor(t.xp)}/${next} XP` : ' · MAX'}</small></span>`;
+}
+
+// Combos a tower type takes part in (hover for the rule).
+const COMBO_ROLES = {
+  laser: [['thermal', 'Focus: Burn Beam + Cryo'], ['exposed', 'Hack: Armor Shred sets up Railguns']],
+  plasma: [['fracture', 'on frozen enemies'], ['thermal', 'Tactical: Napalm + Cryo']],
+  tesla: [['superconduct', 'on chilled enemies'], ['overload', 'on burning enemies']],
+  cryo: [['thermal', 'chill meets burn'], ['superconduct', 'chill sets up Tesla'], ['fracture', 'freezes set up Mortars']],
+  rail: [['exposed', 'on armor-stripped enemies'], ['thermal', 'Caliber: Plasma Jacket + Cryo']],
+  uplink: [['exposed', 'Intrusion: ICE Breaker sets up Railguns']],
+};
+function comboChips(type) {
+  const roles = COMBO_ROLES[type] || [];
+  if (!roles.length) return '';
+  return `<div class="combo-chips">${roles.map(([k, how]) => `<span class="combo-chip" style="--rc:${REACTIONS[k].color}" title="${REACTIONS[k].name} (${how}): ${REACTIONS[k].desc}">⚡ ${REACTIONS[k].name}</span>`).join('')}</div>`;
 }
 
 // ---------------------------------------------------------------- actions
@@ -563,6 +778,7 @@ function doUpgrade(p) {
 function doSell() {
   const t = ui.selected;
   if (!t) return;
+  if (t.fresh) toast(`FULL REFUND +${t.sellValue}¢`, '#39ff14', 1400);
   game.sell(t);
   ui.selected = null;
   renderInfo(true);
@@ -578,13 +794,26 @@ function setSpeed(s) {
   document.querySelectorAll('.speed').forEach((b) => b.classList.toggle('active', Number(b.dataset.speed) === s));
 }
 
+function toggleAuto() {
+  settings.autoStart = !settings.autoStart;
+  autoT = 0;
+  applySettings();
+  toast(settings.autoStart ? 'AUTO-LAUNCH ON // NEXT WAVE STARTS 3s AFTER A CLEAR' : 'AUTO-LAUNCH OFF', '#39ff14', 1600);
+}
+
+function toggleHeat() {
+  settings.heatmap = !settings.heatmap;
+  applySettings();
+  toast(`PLACEMENT HEAT MAP ${settings.heatmap ? 'ON' : 'OFF'}`, '#00f0ff', 1200);
+}
+
 function setPaused(p) {
   paused = p;
   $('#btn-pause').textContent = p ? '▶' : '❚❚';
   if (p && !modalOpen) {
     openModal('PAUSED', '<p>Simulation suspended. The corps are waiting.</p>', [
-      { label: 'QUIT TO MENU', action: () => { closeModal(); paused = false; game = null; show('levels'); } },
-      { label: 'AUDIO', action: () => { closeModal(); showAudioSettings(() => setPaused(true)); } },
+      { label: 'QUIT TO MENU', action: () => { closeModal(); paused = false; audio.clearVoice(); r3d.endCinematic(true); game = null; show('levels'); } },
+      { label: 'SETTINGS', action: () => { closeModal(); showSettings(() => setPaused(true)); } },
       { label: 'RESUME', primary: true, action: () => { closeModal(); setPaused(false); } },
     ]);
   }
@@ -599,6 +828,9 @@ $('#btn-mute').classList.toggle('off', audio.settings.muted);
 $('#btn-wave').addEventListener('click', launch);
 $('#btn-pause').addEventListener('click', () => setPaused(!paused));
 $('#btn-mute').addEventListener('click', toggleMute);
+$('#btn-auto').addEventListener('click', () => { toggleAuto(); audio.play('click'); });
+$('#btn-settings').addEventListener('click', () => { audio.play('click'); if (game && !paused) { paused = true; $('#btn-pause').textContent = '▶'; } showSettings(() => { if (game) setPaused(false); }); });
+$('#cine').addEventListener('pointerdown', (ev) => { ev.stopPropagation(); skipIntro(); });
 document.querySelectorAll('.speed').forEach((b) => b.addEventListener('click', () => { setSpeed(Number(b.dataset.speed)); audio.play('click'); }));
 
 // ---------------------------------------------------------------- canvas input
@@ -677,6 +909,8 @@ window.addEventListener('keydown', (ev) => {
   }
   if (screen !== 'game' || !game) return;
   const k = ev.key.toLowerCase();
+  if ((k === ' ' || k === 'escape' || k === 'enter') && skipIntro()) { ev.preventDefault(); return; }
+  if (r3d.cinematic) return;
   if (r3d.cameraKey(k, true)) { ev.preventDefault(); return; }
   if (k >= '1' && k <= '6') { selectBuild(TOWER_ORDER[Number(k) - 1]); return; }
   switch (k) {
@@ -692,7 +926,9 @@ window.addEventListener('keydown', (ev) => {
     case 'z': r3d.turnView(-1); break;
     case 'x': r3d.turnView(1); break;
     case 'c': r3d.resetView(); break;
-    case 'f': setSpeed(speed % 3 + 1); break;
+    case 'f': setSpeed(speed % 4 + 1); break;
+    case 'a': toggleAuto(); break;
+    case 'h': toggleHeat(); break;
     case 'm': toggleMute(); break;
     case 'q': armAbility('emp'); break;
     case 'w': armAbility('orbital'); break;
@@ -729,6 +965,25 @@ function threatCard(type) {
   pushToast(el, 7000);
 }
 
+function variantCard(mod) {
+  const m = MODS[mod];
+  const el = document.createElement('div');
+  el.className = 'toast threat';
+  el.style.setProperty('--c', m.color);
+  el.innerHTML = `<div><div class="tt">VARIANT DETECTED</div><div class="tn">${m.name}</div><div class="td">${m.desc}</div></div>`;
+  pushToast(el, 6000);
+}
+
+// Handler subtitles, shown for as long as the line plays (or would play, when muted).
+let commsTimer = null;
+audio.onLine = (key, text, secs) => {
+  if (screen !== 'game') return;
+  $('#comms-text').textContent = text;
+  $('#comms').classList.add('show');
+  clearTimeout(commsTimer);
+  commsTimer = setTimeout(() => $('#comms').classList.remove('show'), secs * 1000);
+};
+
 function banner(text, sub, boss) {
   const el = $('#banner');
   el.className = 'banner';
@@ -763,21 +1018,49 @@ function closeModal() {
   if (cb) cb();
 }
 
-function showAudioSettings(after) {
-  const s = audio.settings;
-  openModal('AUDIO SUBSYSTEM', `
-    <div class="slider"><span>MUSIC</span><input type="range" id="vol-music" min="0" max="1" step="0.05" value="${s.music}"><span id="vol-music-v">${Math.round(s.music * 100)}</span></div>
-    <div class="slider"><span>SFX</span><input type="range" id="vol-sfx" min="0" max="1" step="0.05" value="${s.sfx}"><span id="vol-sfx-v">${Math.round(s.sfx * 100)}</span></div>
-    <p style="color:var(--dim);font-size:12px">Soundtrack and signature sound effects generated with ElevenLabs Music &amp; Sound Effects. Weapon sounds are synthesized live.</p>`,
+function showSettings(after) {
+  const a = audio.settings;
+  const slider = (key, label) => `<div class="slider"><span>${label}</span><input type="range" id="vol-${key}" min="0" max="1" step="0.05" value="${a[key]}"><span id="vol-${key}-v">${Math.round(a[key] * 100)}</span></div>`;
+  const seg = (key, opts) => `<div class="seg" data-key="${key}">${opts.map(([v, l]) => `<button data-v="${v}" class="${settings[key] === v ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+  const onOff = (key) => seg(key, [[true, 'ON'], [false, 'OFF']]);
+  const row = (label, sub, ctl) => `<div class="set-row"><div>${label}<small>${sub}</small></div>${ctl}</div>`;
+  openModal('SETTINGS', `
+    <h4>AUDIO</h4>
+    <div class="set-group">${slider('music', 'MUSIC')}${slider('sfx', 'SFX')}${slider('voice', 'HANDLER')}</div>
+    <h4>GAMEPLAY</h4>
+    <div class="set-group">
+      ${row('Auto-launch waves', 'The next wave starts 3s after the last one clears (A)', onOff('autoStart'))}
+      ${row('Boss intros', 'Camera fly-in and name card when a boss arrives', onOff('intros'))}
+      ${row('Placement heat map', 'Tint pads by how much road a tower would cover (H)', onOff('heatmap'))}
+    </div>
+    <h4>DISPLAY</h4>
+    <div class="set-group">
+      ${row('Screen shake', 'Explosions, boss phases, railgun recoil', seg('shake', [[0, 'OFF'], [0.5, 'LOW'], [1, 'FULL']]))}
+      ${row('CRT scanlines', 'Scanline and vignette overlay', onOff('crt'))}
+      ${row('Floating text', 'Bounty and combo pop-ups', onOff('texts'))}
+    </div>
+    <p style="color:var(--dim);font-size:12px">Soundtrack, sound effects and the handler's voice generated with ElevenLabs Music, Sound Effects and Text to Speech.</p>`,
   [{ label: 'DONE', primary: true, action: () => { closeModal(); if (after) after(); } }]);
-  for (const key of ['music', 'sfx']) {
+  for (const key of ['music', 'sfx', 'voice']) {
     const input = $(`#vol-${key}`);
     input.addEventListener('input', () => {
       audio.set(key, Number(input.value));
       $(`#vol-${key}-v`).textContent = Math.round(input.value * 100);
       if (key === 'sfx') audio.play('laser');
     });
+    if (key === 'voice') input.addEventListener('change', () => audio.say('wave_clear_1'));
   }
+  document.querySelectorAll('#modal .seg').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button');
+      if (!b) return;
+      const raw = b.dataset.v;
+      settings[el.dataset.key] = raw === 'true' ? true : raw === 'false' ? false : Number(raw);
+      el.querySelectorAll('button').forEach((o) => o.classList.toggle('on', o === b));
+      applySettings();
+      audio.play('click');
+    });
+  });
 }
 
 function showHowTo() {
@@ -794,9 +1077,19 @@ function showHowTo() {
       <li><b>Buildings block line of sight</b>: lasers, tesla arcs, railgun slugs and cryo pulses can't reach what's behind them. While placing or inspecting a tower, its range area only covers the ground it can see. Plasma mortars lob over buildings; the Railgun's Thermal Scope punches through them</li>
       <li><b>Phantoms are always cloaked</b>: you need camo detection or a Netrunner Uplink field to hit them</li>
       <li><b>Q</b> EMP Burst · <b>W</b> Orbital Strike · <b>E</b> Overclock — cooldowns only recharge while a wave is running</li>
-      <li><b>F</b> cycle speed · <b>P</b>/<b>Esc</b> pause · <b>M</b> mute · Right-click cancels</li>
+      <li><b>Heat map</b>: while placing, pads are tinted by how much road that tower would see from there (<b>H</b> toggles it). A tower sold in the same build phase it was bought refunds in full</li>
+      <li><b>F</b> cycle speed (1–4×) · <b>A</b> auto-launch waves · <b>P</b>/<b>Esc</b> pause · <b>M</b> mute · Right-click cancels</li>
       <li><b>Right-drag</b> or <b>arrow keys</b> pan the camera · <b>Mouse wheel</b> zooms toward the cursor · <b>Middle-drag</b> (or <b>Shift</b> + right-drag) or <b>Z</b> / <b>X</b> turn it · <b>C</b> resets the view</li>
     </ul>
+    <h4>VETERANCY</h4>
+    <p>Towers earn XP for the damage they deal (Cryo also for every enemy it chills; an Uplink takes a quarter of what the towers it buffs earn). Ranks I–V each add +${Math.round(VET.dmg * 100)}% damage and +${Math.round(VET.rate * 100)}% fire rate. Selling a tower loses its rank.</p>
+    <h4>COMBOS</h4>
+    <ul>${Object.values(REACTIONS).map((r) => `<li><b style="color:${r.color}">${r.name}</b> — ${r.desc}</li>`).join('')}</ul>
+    <h4>BOSSES</h4>
+    <p>Bosses have <b>skulls</b> on their health bar. At each one the hull locks for a moment and the boss triggers its protocol — the Titan vents an EMP that knocks out nearby towers, the Overmind hijacks your most valuable towers.</p>
+    <h4>VARIANTS</h4>
+    <ul>${Object.values(MODS).map((m) => `<li><b style="color:${m.color}">${m.name}</b> — ${m.desc}</li>`).join('')}</ul>
+    <p>Late campaign waves field the first three; in endless mode every wave rolls mutators from the whole list.</p>
     <h4>DEFENSES</h4><div class="legend">${towerRows}</div>
     <h4>HOSTILES</h4><div class="legend">${enemyRows}</div>`,
   [{ label: 'GOT IT', primary: true, action: closeModal }]);
@@ -819,6 +1112,15 @@ function updateMusic(dt) {
   audio.playMusic(bossActive ? 'boss' : 'battle');
 }
 
+// Auto-launch: 3s after a wave clears (never the first wave: that one waits for the player's build).
+function updateAuto(dt) {
+  const ready = settings.autoStart && game.state === 'build' && game.wave > 0 && !game.campaignDone && !r3d.cinematic;
+  if (!ready) { autoT = 0; return; }
+  if (autoT <= 0) autoT = 3;
+  autoT -= dt;
+  if (autoT <= 0) { autoT = 0; launch(); }
+}
+
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
@@ -826,12 +1128,18 @@ function frame(now) {
   if (screen === 'game' && game) {
     let simDt = 0;
     if (!paused && !modalOpen) {
-      const step = Math.min(dt, 1 / 30);
-      for (let i = 0; i < speed; i++) game.update(step);
-      simDt = step * speed;
+      // Boss intros run the simulation in slow motion.
+      const cine = r3d.cinematic;
+      const step = Math.min(dt, 1 / 30) * (cine ? 0.25 : 1);
+      const n = cine ? 1 : speed;
+      for (let i = 0; i < n; i++) game.update(step);
+      simDt = step * n;
       updateMusic(dt);
+      updateAuto(dt);
+      checkIntro();
     }
     r3d.render(game, ui, dt, simDt);
+    $('#cine').classList.toggle('show', r3d.cinematic);
     updateHud();
   } else {
     titleFx.render(dt);
@@ -840,5 +1148,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
+applySettings();
+
 // Debug handle for automated testing in the browser console.
-window.__neon = { get game() { return game; }, startGame, ui, audio, setSpeed, r3d, assets };
+window.__neon = { get game() { return game; }, startGame, ui, audio, setSpeed, r3d, assets, settings };
