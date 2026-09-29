@@ -1,0 +1,82 @@
+[
+  {
+    "file": "concept/generated/enemy_courier_t2i.png",
+    "model": "bytedance-seedream-v5-pro-text-to-image",
+    "prediction": "b9eb81d0-4905-4ad3-8e73-08c3388a344e",
+    "refs": [],
+    "ratio": "1:1",
+    "res": "2K",
+    "prompt": "Concept render of a cyberpunk game enemy for conversion into a 3D model: a fast four-legged spider robot, a data thief. A compact boxy sensor head with a square dark visor and one large round camera lens on its side, two round actuator pods under the visor, an upright armored spine module behind the head, four long splayed jointed legs with armored thigh plates, short ribbed rubber bellows at the hips and pointed feet, and two raised manipulator arms with claw grippers on its back reaching up as if to grab something above its head. Chunky industrial military hard-surface design, no loose cables, no logos or text. Materials: dark gunmetal painted metal (#2a2f38) with a satin finish, small yellow hazard bands (#ffd23c) on the feet, thin mint emissive light strips (#3dffc5) on the visor corners and the lens ring only. The whole robot centered with empty space around it, three-quarter front view from about 30 degrees above, all four feet planted on the ground and clearly separated from the body, symmetrical stance. Plain seamless light-grey studio background, soft even diffused lighting, faint contact shadow, everything in sharp focus, with no depth of field, no bloom and no vignette.",
+    "cost": 0.09,
+    "date": "2026-09-28T20:56:11.575Z"
+  },
+  {
+    "file": "concept/generated/enemy_courier_t2i_v2.png",
+    "model": "bytedance-seedream-v5-pro-text-to-image",
+    "prediction": "fe11f423-0523-4761-8338-e06e88c09194",
+    "refs": [],
+    "ratio": "1:1",
+    "res": "2K",
+    "prompt": "Concept render of a cyberpunk game enemy for conversion into a 3D model: a fast four-legged spider robot, a data thief. A compact boxy sensor head with a square dark visor and one large round camera lens on its side, two round actuator pods under the visor, an upright armored spine module behind the head, four long splayed jointed legs with armored thigh plates, short ribbed rubber bellows at the hips and pointed feet, and two raised manipulator arms with claw grippers on its back reaching up as if to grab something above its head. Chunky industrial military hard-surface design, no loose cables, no logos or text. Materials: dark gunmetal painted metal (#2a2f38) with a satin finish, small yellow hazard bands (#ffd23c) on the feet, thin mint emissive light strips (#3dffc5) on the visor corners and the lens ring only. The whole robot centered with empty space around it, three-quarter front view from about 30 degrees above, all four feet planted on the ground and clearly separated from the body, symmetrical stance. Plain seamless light-grey studio background, soft even diffused lighting, faint contact shadow, everything in sharp focus, with no depth of field, no bloom and no vignette.",
+    "cost": 0.09,
+    "date": "2026-09-28T20:56:23.096Z"
+  },
+  {
+    "file": "concept/generated/hero_warbot_t2i.png",
+    "model": "bytedance-seedream-v5-pro-text-to-image",
+    "prediction": "7d9dd11e-aa46-4df5-81bb-de96257ca9dc",
+    "refs": [],
+    "ratio": "1:1",
+    "res": "2K",
+    "prompt": "Concept render of the player's hero unit in a cyberpunk tower-defense game, for conversion into a rigged 3D model: a heavy four-legged spider war robot that walks anywhere on the battlefield. A compact armored boxy sensor head with a square dark visor and one large round camera lens on its side, two round actuator pods under the visor, an upright armored spine module behind the head with an ammunition drum, four thick splayed jointed legs with armored thigh plates, short ribbed rubber bellows at the hips and heavy pointed feet, and two raised combat arms on its back curling forward over the head, each ending in a chunky short-barreled autocannon with a thick shroud. Heroic, imposing, battle-ready industrial military hard-surface design with a distinctive silhouette from above; no loose cables, antennas, logos or text. Materials: dark gunmetal painted metal (#2a2f38) with a satin finish and light edge wear, yellow hazard bands (#ffe600) on the feet and arm joints, thin cyan emissive light strips (#00f0ff) on the visor corners, the lens ring and the gun muzzles only. The whole robot centered with empty space around it, three-quarter front view from about 30 degrees above, all four feet planted on the ground in a wide symmetrical stance, legs and arms clearly separated from the body. Plain seamless light-grey studio background, soft even diffused lighting, faint contact shadow, everything in sharp focus, with no depth of field, no bloom and no vignette.",
+    "cost": 0.09,
+    "date": "2026-09-28T20:58:55.064Z"
+  },
+  {
+    "file": "concept/generated/hero_warbot_t2i_v2.png",
+    "model": "bytedance-seedream-v5-pro-text-to-image",
+    "prediction": "63ab526d-2be6-4d4c-87ae-e3b9374738a1",
+    "refs": [],
+    "ratio": "1:1",
+    "res": "2K",
+    "prompt": "Concept render of the player's hero unit in a cyberpunk tower-defense game, for conversion into a rigged 3D model: a heavy four-legged spider war robot that walks anywhere on the battlefield. A compact armored boxy sensor head with a square dark visor and one large round camera lens on its side, two round actuator pods under the visor, an upright armored spine module behind the head with an ammunition drum, four thick splayed jointed legs with armored thigh plates, short ribbed rubber bellows at the hips and heavy pointed feet, and two raised combat arms on its back curling forward over the head, each ending in a chunky short-barreled autocannon with a thick shroud. Heroic, imposing, battle-ready industrial military hard-surface design with a distinctive silhouette from above; no loose cables, antennas, logos or text. Materials: dark gunmetal painted metal (#2a2f38) with a satin finish and light edge wear, yellow hazard bands (#ffe600) on the feet and arm joints, thin cyan emissive light strips (#00f0ff) on the visor corners, the lens ring and the gun muzzles only. The whole robot centered with empty space around it, three-quarter front view from about 30 degrees above, all four feet planted on the ground in a wide symmetrical stance, legs and arms clearly separated from the body. Plain seamless light-grey studio background, soft even diffused lighting, faint contact shadow, everything in sharp focus, with no depth of field, no bloom and no vignette.",
+    "cost": 0.09,
+    "date": "2026-09-28T20:59:09.145Z"
+  },
+  {
+    "file": "concept/generated/hero_warbot_gptref.png",
+    "model": "gpt-image-v2-5-sunburst-edit",
+    "prediction": "8a2fbff7-1592-4aec-a733-b85830b0b8c1",
+    "refs": [
+      "concept/references/spiderbot-militech.jpg"
+    ],
+    "input": {
+      "quality": "high",
+      "background": "transparent",
+      "output_format": "png",
+      "num_images": 1,
+      "image_size": "2048x2048"
+    },
+    "prompt": "Image 1 is a design reference only: use its design language, not its lighting, background or camera. Redesign this four-legged spider robot as the player's hero war bot in a cyberpunk tower-defense game, a clean concept render that will be converted into a rigged 3D model. Keep its character: a compact boxy sensor head with a square visor and one large round lens on its side, two round actuator pods under the visor, an upright spine module behind the head, four long splayed jointed legs with pointed feet, and two raised arms on its back. Change: make it heavier and battle-ready, with thicker legs covered in rigid armored plates instead of cloth and short ribbed rubber bellows at the hips; replace the claw grippers with chunky short-barreled autocannons with thick shrouds, curling forward over the head; add an armored ammunition drum to the spine module; remove loose cables, thin linkages, logos and text. Materials: dark gunmetal painted metal (#2a2f38) with a satin finish and light edge wear, yellow hazard bands (#ffe600) on the feet and arm joints, thin cyan emissive light strips (#00f0ff) on the visor corners, the lens ring and the gun muzzles only. Show the whole robot centered with empty space around it, three-quarter front view from about 30 degrees above, all four feet planted on the ground in a wide symmetrical stance, legs and arms clearly separated from the body. Fully transparent background with clean alpha edges and no backdrop, floor or cast shadow; soft even diffused studio lighting, everything in sharp focus, with no depth of field, no bloom and no vignette.",
+    "cost": 0.120919,
+    "date": "2026-09-28T21:01:50.720Z"
+  },
+  {
+    "file": "concept/generated/hero_view_back.png",
+    "model": "gpt-image-v2-5-sunburst-edit",
+    "prediction": "3b06e8a7-c61c-4bbb-b388-92e20491e8cf",
+    "refs": [
+      "concept/generated/hero_warbot_gptref.png"
+    ],
+    "input": {
+      "quality": "high",
+      "background": "transparent",
+      "output_format": "png",
+      "num_images": 1,
+      "image_size": "2048x2048"
+    },
+    "prompt": "Image 1 shows our hero robot. Render the exact same robot, with identical design, proportions, parts, colors, hazard markings, wear and pose, only seen from a different angle: a straight-on back view from directly behind, with the robot facing away from the camera. Show the rear of the head, the spine module with its ammunition drum, the arm mounts and the backs of all four legs. Level camera at the height of the middle of the body, orthographic projection with no perspective distortion. The whole robot is centered and fills most of the frame with a small even margin; nothing is cropped. Fully transparent background with clean alpha edges and no floor or cast shadow; soft even diffused studio lighting with no strong highlights; everything in sharp focus. This is a technical turnaround view for 3D modeling: no text, labels or extra objects.",
+    "cost": 0.120153,
+    "date": "2026-09-28T21:14:57.229Z"
+  }
+]

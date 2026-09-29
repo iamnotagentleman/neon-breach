@@ -17,7 +17,7 @@ const DT = 1 / 30;
 const STREAM = 40; // seconds of spawning
 const RUN = 70; // seconds simulated
 const GAP = 0.6; // seconds between spawns
-const TIER_WAVE = [4, 4, 7, 10, 14, 18]; // stream difficulty used to judge base / tier 1..5
+const TIER_WAVE = [8, 8, 14, 24, 40, 60]; // stream difficulty used to judge base / tier 1..5 (80-wave campaign)
 
 // Stream for wave w: enemy types weighted by count over the nearby campaign waves (no bosses, jammers or couriers).
 function streamTypes(w) {
@@ -177,7 +177,7 @@ async function flow(runs) {
   for (const [name, gs] of byMap) {
     console.log(`\n${name} (${gs.length} runs)   wave: banked at launch / earned so far / spent so far / towers`);
     const out = [];
-    for (const w of [1, 3, 5, 8, 10, 12, 15, 18, 20]) {
+    for (const w of [1, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80]) {
       const rows = gs.map((g) => g.flowLog.find((r) => r.wave === w)).filter(Boolean);
       if (!rows.length) continue;
       const avg = (k) => Math.round(rows.reduce((a, r) => a + r[k], 0) / rows.length);

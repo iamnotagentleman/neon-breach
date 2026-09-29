@@ -30,15 +30,20 @@ for name in names:
     world.node_tree.nodes['Background'].inputs['Color'].default_value = (0.05, 0.03, 0.09, 1)
     world.node_tree.nodes['Background'].inputs['Strength'].default_value = 0.6
     bpy.ops.import_scene.gltf(filepath=os.path.join(models, name + '.glb'))
-    # Strike a mid-stride pose for animated characters.
+    # Strike a mid-stride pose for animated characters (units with an idle clip, like the hero, stand at rest).
     for o in sc.objects:
+        if o.type == 'ARMATURE' and o.animation_data and 'idle' in bpy.data.actions:
+            o.animation_data.action = bpy.data.actions['idle']
         if o.type == 'ARMATURE' and o.animation_data and o.animation_data.action:
             fr = o.animation_data.action.frame_range
             sc.frame_set(int(fr[0] + (fr[1] - fr[0]) * 0.3))
     dg = bpy.context.evaluated_depsgraph_get()
     pts = []
     for o in sc.objects:
-        if o.type == 'MESH':
+        # The glTF importer adds an Icosphere as the bone display shape of rigged models: not part of the model.
+        if o.type == 'MESH' and o.name.startswith('Icosphere'):
+            o.hide_render = True
+        elif o.type == 'MESH':
             ev = o.evaluated_get(dg)
             m = ev.to_mesh()
             pts += [ev.matrix_world @ v.co for v in m.vertices]

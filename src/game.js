@@ -1,7 +1,7 @@
 // Pure simulation: no DOM, no audio. Renderer and UI read state; side effects go through `hooks`.
 import {
-  TILE, COLS, ROWS, TOWERS, ENEMIES, MAPS, WAVES, ABILITIES, MODS, VET, REACTIONS,
-  hpMultiplier, waveBonus, earlyBonus, SELL_RATIO, endlessWave, computeStats, canUpgradePath,
+  TILE, COLS, ROWS, TOWERS, ENEMIES, MAPS, WAVES, ABILITIES, MODS, VET, REACTIONS, HERO, HERO_RULES,
+  hpMultiplier, rewardScale, waveBonus, earlyBonus, SELL_RATIO, endlessWave, computeStats, canUpgradePath, variantOf, targetsOf,
 } from './config.js';
 
 let nextId = 1;
@@ -198,16 +198,21 @@ export const AIR_HEAT_WEIGHT = 0.25;
 
 // Placement heat map: for every tile, how many tiles of road a `type` tower anchored there would cover (only road it
 // can see, unless it fires over buildings), or -1 where it can't be built. Uplinks score the towers they'd buff.
-// Towers that hit flyers also score the sky lanes they'd see (over the low-rise blocks), at AIR_HEAT_WEIGHT;
-// the parts are kept on the result as `.road` and `.air` (tiles in view).
-export function coverageMap(game, type) {
+// Towers that hit flyers also score the sky lanes they'd see (over the low-rise blocks), at AIR_HEAT_WEIGHT, or in
+// full for an anti-air-only variant; the parts are kept on the result as `.road` and `.air` (tiles in view).
+export function coverageMap(game, type, variantId = null) {
   const def = TOWERS[type], size = def.size || 1;
-  const r = def.base.range * TILE;
+  const variant = variantOf(def, variantId);
+  const base = computeStats(def, [0, 0, 0], 0, variant);
+  const hits = targetsOf(def, base, variant);
+  const r = base.range * TILE;
   const walls = type !== 'plasma' && type !== 'uplink';
   const STEP = 8;
   game.roadSamples ||= routeSamples(game.paths, STEP);
   game.airSamples ||= routeSamples(game.airPaths, STEP);
-  const air = def.air ? game.airSamples : [];
+  const road = hits.ground || type === 'uplink' ? game.roadSamples : [];
+  const air = hits.air ? game.airSamples : [];
+  const airWeight = hits.ground ? AIR_HEAT_WEIGHT : 1;
   const out = new Float32Array(COLS * ROWS).fill(-1);
   out.road = new Float32Array(COLS * ROWS);
   out.air = new Float32Array(COLS * ROWS);
@@ -222,7 +227,7 @@ export function coverageMap(game, type) {
           if (t.type !== 'uplink' && (t.x - x) ** 2 + (t.y - y) ** 2 <= (r + TILE * t.size * 0.5) ** 2) v += 1 + t.level;
         }
       } else {
-        for (const q of game.roadSamples) {
+        for (const q of road) {
           if ((q.x - x) ** 2 + (q.y - y) ** 2 <= r * r && (!walls || game.los(x, y, q.x, q.y))) v += STEP / TILE;
         }
         for (const q of air) {
@@ -230,7 +235,7 @@ export function coverageMap(game, type) {
         }
       }
       out.road[i] = v;
-      out[i] = v + out.air[i] * AIR_HEAT_WEIGHT;
+      out[i] = v + out.air[i] * airWeight;
     }
   }
   return out;
@@ -256,25 +261,24 @@ export class Enemy {
     this.type = type;
     this.def = def;
     this.waveId = waveId;
-    // Variants (config MODS): resistances and endless mutators. Bosses never carry them.
-    this.mods = def.boss || !mods ? [] : mods.filter((m) => MODS[m]);
-    const has = (m) => this.mods.includes(m);
-    this.maxHp = def.hp * mul * (has('hardened') ? 1.5 : 1);
+    this.maxHp = def.hp * mul;
     this.hp = this.maxHp;
     this.maxShield = (def.shield || 0) * mul;
     this.shieldLives = def.shieldLives || 0;
-    if (has('warded') && !this.maxShield) { this.maxShield = this.maxHp * 0.5; this.shieldLives = 2; }
     this.shield = this.maxShield;
-    this.armor = (def.armor || 0) + (has('hardened') ? 3 : 0);
-    this.speedMul = has('amped') ? 1.3 : 1;
-    this.regen = has('repair') ? 0.04 : 0;
-    this.mirror = has('mirror');
-    this.insulated = has('insulated');
-    this.thermal = has('thermal');
-    this.cloaked = !!def.cloaked || has('ghosted');
+    this.armor = def.armor || 0;
+    this.speedMul = 1;
+    this.regen = 0;
+    this.mirror = this.insulated = this.thermal = false;
+    this.cloaked = !!def.cloaked;
+    // Variants (config MODS): resistances and endless mutators. Bosses spawn without them but adapt at their skulls
+    // (bossPhase). Hardened goes first so a Warded shield is sized on the hardened hull.
+    this.mods = [];
+    const list = def.boss || !mods ? [] : mods.filter((m) => MODS[m]);
+    for (const m of list.sort((a, b) => (b === 'hardened') - (a === 'hardened'))) this.applyMod(m);
     this.radius = def.radius * TILE;
     this.flying = !!def.flying;
-    this.reward = Math.round(def.reward * 1.3 * (1 + 0.04 * (waveId - 1)) * (1 + 0.2 * this.mods.length));
+    this.reward = Math.round(def.reward * 1.3 * rewardScale(waveId) * (1 + 0.2 * this.mods.length));
     this.healRate = def.heal ? def.heal.rate * mul : 0;
     this.pathIdx = pathIdx;
     this.air = air;
@@ -309,7 +313,26 @@ export class Enemy {
     this.auraSlow = 0; this.auraAmp = 0; this.auraArmorDown = 0;
     this.crackT = 0; // Thermal Shock: armor cracked open
     this.reactT = 0; // per-enemy combo cooldown
+    this.converted = null; // hijacked by the hero: { t, max, cd, hero } while it fights for us
     this.updatePos();
+  }
+
+  // One variant's effect. `adapt`: gained mid-fight by a boss at a skull, where the hull isn't grown (Hardened adds
+  // only armor) and repair and wards come in weaker.
+  applyMod(m, adapt = false) {
+    if (!this.mods.includes(m)) this.mods.push(m);
+    switch (m) {
+      case 'hardened': this.armor += 3; if (!adapt) { this.maxHp *= 1.5; this.hp = this.maxHp; } break;
+      case 'amped': this.speedMul *= 1.3; break;
+      case 'repair': this.regen = adapt ? 0.01 : 0.04; break;
+      case 'warded':
+        if (!this.maxShield) { this.maxShield = this.maxHp * (adapt ? 0.12 : 0.5); this.shield = this.maxShield; this.shieldLives = 2; }
+        break;
+      case 'mirror': this.mirror = true; break;
+      case 'insulated': this.insulated = true; break;
+      case 'thermal': this.thermal = true; this.slowT = this.burnT = this.frozenT = 0; break;
+      case 'ghosted': this.cloaked = true; this.revealed = false; break;
+    }
   }
 
   // Distance left to where this enemy does damage: the core, or the exit for a courier carrying a packet.
@@ -355,6 +378,17 @@ export class Enemy {
     this.reactT = Math.max(0, this.reactT - dt);
     this.phaseT = Math.max(0, this.phaseT - dt);
     this.surgeT = Math.max(0, this.surgeT - dt);
+    // Hijacked: marches back toward its gate shooting its old squad, then self-destructs.
+    if (this.converted) {
+      const c = this.converted;
+      c.t -= dt;
+      this.dist = Math.max(0, this.dist - this.speed * TILE * dt);
+      this.updatePos();
+      if (this.dist <= 0 || c.t <= 0) { game.detonateConvert(this); return; }
+      c.cd -= dt;
+      if (c.cd <= 0) { c.cd = HERO_RULES.convertZapEvery; game.convertZap(this); }
+      return;
+    }
     if (this.regen && game.time - this.lastHit > 1.5 && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * this.regen * dt);
     if (this.burnT > 0) {
       this.burnT -= dt;
@@ -365,7 +399,7 @@ export class Enemy {
     if (this.slowT > 0) this.slowT -= dt;
     const boss = this.def.boss;
     const slow = Math.max(this.slowT > 0 ? this.slowAmt * (boss && !this.slowFull ? 0.5 : 1) : 0, this.auraSlow * (boss ? 0.5 : 1));
-    this.dist += this.dir * this.speed * (1 - Math.min(0.85, slow)) * TILE * dt;
+    this.dist = Math.max(0, this.dist + this.dir * this.speed * (1 - Math.min(0.85, slow)) * TILE * dt);
     this.updatePos();
 
     if (this.maxShield > 0 && game.time - this.lastHit > 2 && this.shield < this.maxShield) {
@@ -374,7 +408,7 @@ export class Enemy {
     if (this.healRate) {
       const r = this.def.heal.radius * TILE;
       for (const o of game.enemies) {
-        if (o.dead || o.hp >= o.maxHp) continue;
+        if (o.dead || o.converted || o.hp >= o.maxHp) continue;
         const dx = o.x - this.x, dy = o.y - this.y;
         if (dx * dx + dy * dy < r * r) o.hp = Math.min(o.maxHp, o.hp + this.healRate * dt * (o === this ? 0.5 : 1));
       }
@@ -401,11 +435,14 @@ export class Enemy {
   }
 }
 
+// Seconds a tower spends re-locking after switching variants (no fire).
+export const RELOCK_TIME = 1.2;
+
 export class Tower {
-  constructor(type, tx, ty) {
+  constructor(type, tx, ty, variant = null, def = TOWERS[type]) {
     this.id = nextId++;
     this.type = type;
-    this.def = TOWERS[type];
+    this.def = def;
     this.tx = tx;
     this.ty = ty;
     this.size = this.def.size || 1;
@@ -433,11 +470,16 @@ export class Tower {
     this.aim = null; // manual aim point (Mortar: ground spot, Railgun: firing line through it), used in 'aim' mode
     this.engaged = false; // has something to shoot at (so it's loading / firing)
     this.charge = 0; // load progress 0..1 while engaged, for the renderer
+    this.variant = variantOf(this.def, variant)?.id ?? null; // e.g. a Pulse Laser's 'ground' / 'air'
+    this.relockT = 0; // re-locking after a variant switch
     this.refresh();
     this.cd = this.stats.rate ? 1 / this.stats.rate : 0; // built unloaded
   }
 
-  refresh() { this.stats = computeStats(this.def, this.tiers, this.rank); }
+  refresh() { this.stats = computeStats(this.def, this.tiers, this.rank, this.variantDef); }
+  get variantDef() { return variantOf(this.def, this.variant); }
+  get hitsAir() { return targetsOf(this.def, this.stats, this.variantDef).air; }
+  get hitsGround() { return targetsOf(this.def, this.stats, this.variantDef).ground; }
   // Highest tier on any path (0-5): drives visual intensity.
   get level() { return Math.max(...this.tiers); }
   get range() { return (this.stats.global ? 40 : this.stats.range) * TILE; }
@@ -489,10 +531,35 @@ export class Tower {
     return true;
   }
 
+  // Default firing line for a tower that can only fire down a fixed line (Annihilator): the bearing whose slug path
+  // covers the most road it can reach (plus a little for sky lane), in 4° steps.
+  defaultLine(game) {
+    game.roadSamples ||= routeSamples(game.paths, 8);
+    game.airSamples ||= routeSamples(game.airPaths, 8);
+    const w = TILE * 0.5;
+    let best = this.angle, bs = -1;
+    for (let deg = 0; deg < 360; deg += 4) {
+      const a = (deg * Math.PI) / 180;
+      const { ux, uy, reach, reachAir } = this.railLine(game, a);
+      let sc = 0;
+      const count = (pts, len, wt) => {
+        for (const q of pts) {
+          const px = q.x - this.x, py = q.y - this.y, along = px * ux + py * uy;
+          if (along > TILE * 0.5 && along <= len && Math.abs(px * uy - py * ux) < w) sc += wt;
+        }
+      };
+      count(game.roadSamples, reach, 1);
+      count(game.airSamples, reachAir, AIR_HEAT_WEIGHT);
+      if (sc > bs) { bs = sc; best = a; }
+    }
+    this.aim = { x: this.x + Math.cos(best) * TILE * 3, y: this.y + Math.sin(best) * TILE * 3 };
+    this.mode = 'aim';
+  }
+
   canHit(e) {
-    if (e.dead) return false;
+    if (e.dead || e.converted) return false;
     if (!e.revealed && !this.stats.camo && !this.camoGrant) return false;
-    return e.flying ? (this.def.air || this.stats.air) : this.def.ground;
+    return e.flying ? this.hitsAir : this.hitsGround;
   }
 
   inRange(e, r) {
@@ -522,7 +589,7 @@ export class Tower {
   hit(game, e, amount, opts = {}) {
     const s = this.stats;
     if (e.def.boss) amount *= s.bossMul;
-    game.damage(e, amount, { tower: this, ...opts });
+    game.damage(e, amount, { tower: this, shieldMul: s.shieldMul, armorMul: s.armorMul, ...opts });
     if (e.dead) return;
     if (s.burn && !e.thermal) {
       // Igniting a chilled enemy: Thermal Shock instead of a burn.
@@ -545,7 +612,7 @@ export class Tower {
   lineHits(game, x0, y0, ux, uy, len, width, groundLen = len) {
     const out = [];
     for (const e of game.enemies) {
-      if (e.dead) continue;
+      if (e.dead || e.converted) continue;
       const px = e.x - x0, py = e.y - y0;
       const along = px * ux + py * uy;
       if (along < 0 || along > (e.flying ? len : groundLen)) continue;
@@ -585,6 +652,7 @@ export class Tower {
     this.engaged = false;
     this.charge = 0;
     if (this.jamT > 0) return; // offline: no fire, no pulses, no fields
+    if (this.relockT > 0) { this.relockT -= dt; return; } // turret swinging to its new variant
     const s = this.stats;
     if (this.type === 'uplink') { this.angle += dt * 1.4; return; }
     const rateMul = (1 + this.buffRate) * (game.overclockT > 0 ? ABILITIES.overclock.mult : 1);
@@ -600,6 +668,8 @@ export class Tower {
 
     if (this.type === 'cryo') { this.pulse(game, dmg, load); return; }
 
+    // Fixed-line weapons (Annihilator) never track: without a line of their own they take the default one.
+    if (s.aimOnly && !this.aiming) this.defaultLine(game);
     if (this.aiming) {
       // Manual aim: load while anything it can hit is in range, then hold the shot until something is about to be
       // in the spot / on the line.
@@ -705,7 +775,7 @@ export class Tower {
       let d = dmg * m, cold = false;
       if (e.slowT > 0 && !e.thermal) { d *= 1.5; cold = true; game.react('superconduct', e); }
       if (e.burnT > 0 && e.reactT <= 0) game.overload(e, this);
-      if (!e.dead) this.hit(game, e, d, { shieldMul: s.shieldMul });
+      if (!e.dead) this.hit(game, e, d);
       return cold;
     };
     let cur = first, mult = 1;
@@ -750,8 +820,8 @@ export class Tower {
         // Exposed: armor-stripped targets take a critical slug.
         const crit = e.stripped && !e.dead;
         if (crit) game.react('exposed', e);
-        // Kinetic slugs spend themselves on energy shields: half effect there (Tesla and EMP are the shield answer).
-        this.hit(game, e, dmg * k * (crit ? 1.5 : 1), { pierce: true, shieldMul: 0.5 });
+        // Kinetic slugs spend themselves on energy shields (shieldMul 0.5): Tesla and EMP are the shield answer.
+        this.hit(game, e, dmg * k * (crit ? 1.5 : 1), { pierce: true });
         k = Math.max(0.5, k - s.slugFalloff);
       }
       const ex = this.x + ux * end, ey = this.y + uy * end;
@@ -797,6 +867,323 @@ export class Tower {
     }
     game.fx.ring(this.x, this.y, 8, r, freezeAll ? '#ffffff' : this.def.color, 0.45, freezeAll ? 4 : 2, { kind: 'frost' });
     game.hooks.sfx('cryo', this);
+  }
+}
+
+// ---------------------------------------------------------------- hero
+// Open ground and road are walkable for the hero; buildings and towers are not.
+const walkable = (game, tx, ty) => tx >= 0 && ty >= 0 && tx < COLS && ty < ROWS && game.grid[ty][tx] <= 1;
+const tileOf = (px) => Math.floor(px / TILE);
+
+// Route for the hero from (x0, y0) to (x1, y1) in pixels: A* over tiles (8-way, no cutting past blocked corners),
+// string-pulled into straight legs. A blocked goal snaps to the nearest open tile. Returns pixel points or null.
+export function heroRoute(game, x0, y0, x1, y1) {
+  let gx = tileOf(x1), gy = tileOf(y1);
+  if (!walkable(game, gx, gy)) {
+    let best = null, bd = Infinity;
+    for (let ty = 0; ty < ROWS; ty++) for (let tx = 0; tx < COLS; tx++) {
+      const d = (tx + 0.5 - x1 / TILE) ** 2 + (ty + 0.5 - y1 / TILE) ** 2;
+      if (d < bd && walkable(game, tx, ty)) { bd = d; best = [tx, ty]; }
+    }
+    if (!best) return null;
+    [gx, gy] = best;
+    x1 = (gx + 0.5) * TILE; y1 = (gy + 0.5) * TILE;
+  }
+  const sx = Math.min(COLS - 1, Math.max(0, tileOf(x0))), sy = Math.min(ROWS - 1, Math.max(0, tileOf(y0)));
+  const idx = (x, y) => y * COLS + x;
+  const g = new Float32Array(COLS * ROWS).fill(Infinity), from = new Int32Array(COLS * ROWS).fill(-1);
+  const open = [idx(sx, sy)];
+  g[open[0]] = 0;
+  const h = (i) => { const dx = Math.abs((i % COLS) - gx), dy = Math.abs(Math.floor(i / COLS) - gy); return Math.max(dx, dy) + 0.414 * Math.min(dx, dy); };
+  const goal = idx(gx, gy);
+  while (open.length) {
+    let bi = 0;
+    for (let k = 1; k < open.length; k++) if (g[open[k]] + h(open[k]) < g[open[bi]] + h(open[bi])) bi = k;
+    const cur = open.splice(bi, 1)[0];
+    if (cur === goal) break;
+    const cx = cur % COLS, cy = Math.floor(cur / COLS);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const nx = cx + dx, ny = cy + dy;
+      if (!walkable(game, nx, ny)) continue;
+      if (dx && dy && (!walkable(game, cx + dx, cy) || !walkable(game, cx, cy + dy))) continue;
+      const n = idx(nx, ny), c = g[cur] + (dx && dy ? 1.414 : 1);
+      if (c < g[n]) { g[n] = c; from[n] = cur; if (!open.includes(n)) open.push(n); }
+    }
+  }
+  if (goal !== idx(sx, sy) && from[goal] < 0) return null;
+  const tiles = [];
+  for (let i = goal; i >= 0 && i !== idx(sx, sy); i = from[i]) tiles.push([(i % COLS + 0.5) * TILE, (Math.floor(i / COLS) + 0.5) * TILE]);
+  tiles.reverse();
+  if (tiles.length) tiles[tiles.length - 1] = [x1, y1];
+  else tiles.push([x1, y1]);
+  // String-pull: from each corner, head straight for the furthest point still reachable over open tiles.
+  const clear = (ax, ay, bx, by) => {
+    const n = Math.ceil(Math.hypot(bx - ax, by - ay) / (TILE * 0.2));
+    for (let k = 0; k <= n; k++) {
+      const x = ax + ((bx - ax) * k) / n, y = ay + ((by - ay) * k) / n;
+      if (!walkable(game, tileOf(x), tileOf(y)) && !(tileOf(x) === sx && tileOf(y) === sy)) return false;
+    }
+    return true;
+  };
+  const out = [];
+  let ax = x0, ay = y0, i = 0;
+  while (i < tiles.length) {
+    let j = tiles.length - 1;
+    while (j > i && !clear(ax, ay, ...tiles[j])) j--;
+    out.push(tiles[j]);
+    [ax, ay] = tiles[j];
+    i = j + 1;
+  }
+  return out;
+}
+
+// Road samples every 8px with how far along their road they sit (0 = gate, 1 = core): where traps can go.
+function trapSamples(game) {
+  const out = [];
+  for (const p of game.paths) {
+    for (let d = 0; d < p.length; d += 8) {
+      const q = pathPoint(p, d);
+      if (q.x >= 0 && q.y >= 0 && q.x <= COLS * TILE && q.y <= ROWS * TILE) out.push({ x: q.x, y: q.y, k: d / p.length });
+    }
+  }
+  return out;
+}
+
+const turnToward = (a, b, max) => {
+  const d = ((b - a + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+  return a + Math.max(-max, Math.min(max, d));
+};
+
+export class Hero extends Tower {
+  constructor(x, y) {
+    super('hero', tileOf(x), tileOf(y), null, HERO);
+    this.isHero = true;
+    this.x = x;
+    this.y = y;
+    this.heading = -Math.PI / 2; // body facing (the guns aim along `angle`)
+    this.angle = this.heading;
+    this.route = [];
+    this.dest = null;
+    this.moving = false;
+    this.lastHurt = -99;
+    this.hurtT = 0;
+    this.contact = 0; // enemies shooting at it
+    this.downT = 0; // knocked out: seconds until it reboots
+    this.rebootT = HERO_RULES.rebootTime; // booting up (deploy, reboot): no moving or firing
+    this.downs = 0;
+    this.side = 0; // which cannon fires next
+    this.hackCd = 3;
+    this.missileCd = 1;
+    this.layCd = 1;
+    this.trapsLaid = 0;
+    this.hacks = 0;
+  }
+
+  // Stats as a tower's, plus the hull: it grows with rank and every tier bought (the damage taken carries over).
+  refresh() {
+    const k = this.maxHp ? this.hp / this.maxHp : 1;
+    super.refresh();
+    const tiers = this.tiers.reduce((a, b) => a + b, 0);
+    this.maxHp = this.stats.hp * (1 + HERO_RULES.hpPerRank * this.rank) * (1 + HERO_RULES.hpPerTier * tiers);
+    this.hp = this.maxHp * k;
+  }
+
+  get online() { return this.downT <= 0 && this.rebootT <= 0; }
+  get sellValue() { return 0; }
+  get aimable() { return false; }
+  // It moves, so sight isn't cached per enemy cell like a tower's.
+  sees(game, e) { return game.los(this.x, this.y, e.x, e.y, e.flying); }
+
+  muzzle(side = this.side) {
+    const a = this.angle, o = (side ? 1 : -1) * 0.2 * TILE;
+    return [this.x + Math.cos(a) * 0.35 * TILE - Math.sin(a) * o, this.y + Math.sin(a) * 0.35 * TILE + Math.cos(a) * o];
+  }
+
+  // No orders get through while it's knocked out or jammed.
+  moveTo(game, x, y) {
+    if (this.downT > 0 || this.jamT > 0) return false;
+    const route = heroRoute(game, this.x, this.y, x, y);
+    if (!route) return false;
+    this.route = route;
+    const [dx, dy] = route[route.length - 1];
+    this.dest = { x: dx, y: dy };
+    return true;
+  }
+
+  stop() { this.route = []; this.dest = null; }
+
+  hurt(game, amount) {
+    if (this.downT > 0 || this.rebootT > 0) return;
+    this.hp -= amount;
+    this.lastHurt = game.time;
+    this.hurtT = 0.2;
+    if (this.hp > 0) return;
+    this.hp = 0;
+    this.downT = HERO_RULES.downTime;
+    this.downs++;
+    this.stop();
+    game.fx.explosion(this.x, this.y, HERO.color, TILE * 0.5);
+    game.fx.emit({ type: 'herodown', hero: this });
+    game.shake = Math.max(game.shake, 9);
+    game.hooks.sfx('herodown', this);
+    game.hooks.heroDown(this);
+  }
+
+  update(dt, game) {
+    const R = HERO_RULES, s = this.stats;
+    this.fireFlash = Math.max(0, this.fireFlash - dt);
+    this.hurtT = Math.max(0, this.hurtT - dt);
+    this.engaged = false;
+    this.charge = 0;
+    this.moving = false;
+    if (this.downT > 0) {
+      this.downT -= dt;
+      if (this.downT <= 0) {
+        this.downT = 0;
+        this.rebootT = R.rebootTime;
+        this.hp = this.maxHp;
+        game.fx.emit({ type: 'heroreboot', hero: this });
+        game.hooks.sfx('heroreboot', this);
+        game.hooks.heroUp(this);
+      }
+      return;
+    }
+    if (this.rebootT > 0) { this.rebootT -= dt; return; }
+
+    // Walk the route; the body turns toward where it's going. Jammed, it freezes where it stands (the walk resumes after).
+    if (this.route.length && this.jamT <= 0) {
+      const [tx, ty] = this.route[0];
+      const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), step = s.speed * TILE * dt;
+      if (d <= step) { this.x = tx; this.y = ty; this.route.shift(); if (!this.route.length) this.dest = null; }
+      else { this.x += (dx / d) * step; this.y += (dy / d) * step; }
+      if (d > 1) this.heading = turnToward(this.heading, Math.atan2(dy, dx), 9 * dt);
+      this.moving = true;
+    }
+
+    // Return fire: every armed enemy that has it in range and in sight shoots it once a second (buildings block the
+    // shot, flyers fire over the low blocks); out of fire it self-repairs.
+    let firing = 0;
+    for (const e of game.enemies) {
+      const a = e.def.atk;
+      if (!a || e.dead || e.converted || e.stunT > 0 || e.phaseT > 0) continue;
+      const r = a.range * TILE + R.bodyR * TILE;
+      if ((e.x - this.x) ** 2 + (e.y - this.y) ** 2 > r * r || !game.los(e.x, e.y, this.x, this.y, e.flying)) continue;
+      firing++;
+      e.atkT = (e.atkT ?? Math.random()) - dt;
+      if (e.atkT > 0) continue;
+      e.atkT += 1;
+      this.hurt(game, e.maxHp * a.dps);
+      game.fx.emit({ type: 'enemyshot', enemy: e, hero: this });
+      game.hooks.sfx('herohit', this);
+      if (this.downT > 0) return;
+    }
+    this.contact = firing; // enemies firing at it right now
+    if (!firing && game.time - this.lastHurt > R.regenDelay && this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.maxHp * R.regen * dt);
+
+    if (this.jamT > 0) return; // jammed: no control, no guns, no traps
+    this.lay(dt, game);
+    const rateMul = (1 + this.buffRate) * (game.overclockT > 0 ? ABILITIES.overclock.mult : 1);
+    const dmg = s.dmg * (1 + this.buffDmg);
+    this.hackCd = Math.max(0, this.hackCd - dt);
+    if (s.hackEvery && this.hackCd <= 0 && this.hack(game)) this.hackCd = s.hackEvery;
+    const targets = this.acquire(game, s.targets);
+    if (!targets.length) return;
+    const target = targets[0];
+    this.engaged = true;
+    this.angle = Math.atan2(target.y - this.y, target.x - this.x);
+    if (!this.moving) this.heading = turnToward(this.heading, this.angle, 5 * dt);
+    if (s.missiles) {
+      this.missileCd -= dt * rateMul;
+      if (this.missileCd <= 0) { this.missileCd = s.missileEvery; this.salvo(game, dmg); }
+    }
+    this.cd -= dt * rateMul;
+    this.charge = Math.min(1, Math.max(0, 1 - this.cd * s.rate));
+    if (this.cd > 0) return;
+    this.cd += 1 / s.rate;
+    this.fireFlash = 0.1;
+    this.shots++;
+    targets.forEach((e, i) => {
+      const side = (this.side + i) % 2;
+      this.hit(game, e, dmg, { pierce: !!s.pierceArmor });
+      game.fx.emit({ type: 'herofire', hero: this, target: e, side });
+    });
+    this.side = (this.side + 1) % 2;
+    game.fx.sparks(target.x, target.y, HERO.color, 3, 80);
+    game.hooks.sfx('heroshot', this);
+  }
+
+  // Signal Spike / Hijack: the strongest enemies in range are stunned and marked, or (HIJACK on) turned. Bosses run
+  // hardened firmware: immune to all of it.
+  hack(game) {
+    const s = this.stats;
+    const pool = game.enemies.filter((e) => !e.def.boss && this.canHit(e) && this.inRange(e, this.range) && this.sees(game, e))
+      .sort((a, b) => b.hp + b.shield - (a.hp + a.shield));
+    if (!pool.length) return false;
+    for (const e of pool.slice(0, s.convert || 1)) {
+      if (s.convert) game.convert(e, this);
+      else {
+        e.stun(s.hackStun);
+        e.markAmp = Math.max(e.markT > 0 ? e.markAmp : 0, s.hackMark);
+        e.markT = 5;
+      }
+      game.fx.emit({ type: 'herohack', hero: this, enemy: e, convert: !!s.convert });
+    }
+    this.hacks++;
+    game.hooks.sfx(s.convert ? 'herohijack' : 'herohack', this);
+    return true;
+  }
+
+  // Hellfire Pods: micro-missiles spread over the targets in range, led onto where they'll be.
+  salvo(game, dmg) {
+    const s = this.stats;
+    const pool = this.acquire(game, s.missiles);
+    if (!pool.length) return;
+    for (let i = 0; i < s.missiles; i++) {
+      const e = pool[i % pool.length];
+      const dur = 0.35 + Math.hypot(e.x - this.x, e.y - this.y) / (9 * TILE) + i * 0.04;
+      const sp = e.stunT > 0 ? 0 : e.speed * TILE * 0.8;
+      const j = () => (Math.random() - 0.5) * TILE * 0.35;
+      game.projectiles.push({
+        kind: 'missile', id: nextId++, x0: this.x, y0: this.y, t: 0, dur, dmg: dmg * s.missileDmg, splash: 0.7 * TILE,
+        tx: e.x + Math.cos(e.angle) * sp * dur + j(), ty: e.y + Math.sin(e.angle) * sp * dur + j(), air: e.flying, tower: this, color: HERO_RULES.missileColor,
+      });
+    }
+    game.fx.emit({ type: 'herosalvo', hero: this });
+    game.hooks.sfx('missile', this);
+  }
+
+  // Trapper: plants a trap on the road in range whenever it has one to spare.
+  lay(dt, game) {
+    const s = this.stats;
+    if (!s.mines) return;
+    this.layCd -= dt;
+    if (this.layCd > 0) return;
+    if (game.traps.filter((t) => t.hero === this).length >= s.mines) { this.layCd = 0.4; return; }
+    const spot = this.trapSpot(game);
+    if (!spot) { this.layCd = 1; return; }
+    this.layCd = s.mineEvery;
+    this.trapsLaid++;
+    const trap = { id: nextId++, hero: this, x: spot.x, y: spot.y, emp: !!s.empTrap && this.trapsLaid % s.empTrap === 0, armT: 0.8, age: 0 };
+    game.traps.push(trap);
+    game.fx.emit({ type: 'trapset', hero: this, trap });
+    game.hooks.sfx('trapset', this);
+  }
+
+  // Road in range, away from the other traps (spread out), leaning toward the gate end so enemies meet them first.
+  trapSpot(game) {
+    game.trapSamples ||= trapSamples(game);
+    const r = this.range, gap = TILE;
+    let best = null, bs = -Infinity;
+    for (const q of game.trapSamples) {
+      if ((q.x - this.x) ** 2 + (q.y - this.y) ** 2 > r * r) continue;
+      let near = 3 * TILE;
+      for (const t of game.traps) near = Math.min(near, Math.hypot(t.x - q.x, t.y - q.y));
+      if (near < gap) continue;
+      const sc = near / TILE - q.k * 0.5 + Math.random() * 0.3;
+      if (sc > bs) { bs = sc; best = q; }
+    }
+    return best;
   }
 }
 
@@ -871,6 +1258,7 @@ export class Game {
     this.hooks = {
       sfx: noop, message: noop, newThreat: noop, newVariant: noop, waveStart: noop, waveClear: noop, end: noop, leak: noop,
       bossSpawn: noop, bossPhase: noop, steal: noop, escape: noop, recover: noop, jammed: noop, rankUp: noop, reaction: noop,
+      heroDown: noop, heroUp: noop,
       ...hooks,
     };
     this.paths = this.map.paths.map(buildPath);
@@ -891,6 +1279,8 @@ export class Game {
     this.endless = false;
     this.time = 0;
     this.towers = [];
+    this.hero = null; // the player's war bot, once deployed
+    this.traps = []; // the hero's road traps
     this.enemies = [];
     this.projectiles = [];
     this.timers = [];
@@ -908,11 +1298,14 @@ export class Game {
     this.packets = []; // data packets dropped by couriers, drifting back to the core
     this.retired = []; // sold towers, kept for the end-of-run breakdown
     this.reactShown = {};
-    this.stats = { kills: 0, leaked: 0, spent: 0, earned: 0, stolen: 0, escaped: 0, recovered: 0, reactions: {}, dmgByType: {} };
+    this.stats = { kills: 0, leaked: 0, spent: 0, earned: 0, stolen: 0, escaped: 0, recovered: 0, reactions: {}, dmgByType: {}, converted: 0, traps: 0 };
   }
 
   get core() { const p = this.paths[0].pts; return p[p.length - 1]; }
-  get busy() { return this.spawners.length > 0 || this.enemies.length > 0; }
+  // Hijacked enemies marching home don't hold up the next build phase.
+  get busy() { return this.spawners.length > 0 || this.enemies.some((e) => !e.converted); }
+  // Everything that can be jammed, buffed by Uplinks or knocked out by an EMP: the towers and the hero.
+  get units() { return this.hero ? [...this.towers, this.hero] : this.towers; }
   get campaignDone() { return !this.endless && this.wave >= this.totalWaves; }
 
   waveDef(n) { return n <= WAVES.length ? WAVES[n - 1] : endlessWave(n); }
@@ -928,6 +1321,8 @@ export class Game {
   }
 
   canPlace(tx, ty, size = 1) {
+    const h = this.hero;
+    if (h && tileOf(h.x) >= tx && tileOf(h.x) < tx + size && tileOf(h.y) >= ty && tileOf(h.y) < ty + size) return false;
     for (let y = ty; y < ty + size; y++) {
       for (let x = tx; x < tx + size; x++) {
         if (x < 0 || y < 0 || x >= COLS || y >= ROWS || this.grid[y][x] !== 0) return false;
@@ -944,10 +1339,10 @@ export class Game {
     for (let y = t.ty; y < t.ty + t.size; y++) for (let x = t.tx; x < t.tx + t.size; x++) this.grid[y][x] = value;
   }
 
-  build(type, tx, ty) {
+  build(type, tx, ty, variant = null) {
     const def = TOWERS[type];
     if (!this.canPlace(tx, ty, def.size || 1) || this.credits < def.cost) return null;
-    const t = new Tower(type, tx, ty);
+    const t = new Tower(type, tx, ty, variant);
     t.fresh = this.state === 'build';
     this.towers.push(t);
     this.setFootprint(t, 3);
@@ -956,7 +1351,38 @@ export class Game {
     this.fx.ring(t.x, t.y, 4, TILE * 0.8, def.color, 0.4, 2);
     this.fx.sparks(t.x, t.y, def.color, 12, 90);
     this.hooks.sfx('build', t);
+    if (this.hero?.dest && !this.hero.moveTo(this, this.hero.dest.x, this.hero.dest.y)) this.hero.stop();
     return t;
+  }
+
+  // The hero goes down anywhere the war bot can stand (open ground or road). One per run.
+  canDeployHero(px, py) {
+    const tx = tileOf(px), ty = tileOf(py);
+    return !this.hero && walkable(this, tx, ty);
+  }
+
+  deployHero(px, py) {
+    if (!this.canDeployHero(px, py) || this.credits < HERO.cost) return null;
+    const h = new Hero(px, py);
+    this.hero = h;
+    this.credits -= HERO.cost;
+    this.stats.spent += HERO.cost;
+    this.fx.ring(px, py, 4, TILE * 1.1, HERO.color, 0.5, 3);
+    this.fx.sparks(px, py, HERO.color, 18, 110);
+    this.fx.emit({ type: 'herodeploy', hero: h });
+    this.hooks.sfx('herodeploy', h);
+    return h;
+  }
+
+  // Switch a tower's variant (Pulse Laser: Ground / Anti-Air). Free, but the turret re-locks and has to reload.
+  setVariant(t, id) {
+    if (!t.def.variants || t.variant === id || !t.def.variants.some((v) => v.id === id)) return false;
+    t.variant = id;
+    t.refresh();
+    t.relockT = RELOCK_TIME;
+    t.cd = 1 / t.stats.rate;
+    this.fx.emit({ type: 'variant', tower: t });
+    return true;
   }
 
   upgrade(t, p) {
@@ -976,6 +1402,7 @@ export class Game {
   }
 
   sell(t) {
+    if (t.isHero) return;
     const v = t.sellValue;
     if (t.dmgDealt > 0 || t.kills > 0) this.retired.push({ type: t.type, tiers: [...t.tiers], rank: t.rank, dmg: t.dmgDealt, kills: t.kills, sold: true });
     this.credits += v;
@@ -1025,8 +1452,9 @@ export class Game {
   }
 
   // `raw` damage (combo bursts) skips the variant resistances.
-  damage(e, amount, { tower = null, pierce = false, shieldMul = 1, quiet = false, raw = false } = {}) {
-    if (e.dead || amount <= 0 || e.phaseT > 0) return 0;
+  // `shieldMul` scales what reaches an energy shield, `armorMul` what hits a hull that still has armor on it.
+  damage(e, amount, { tower = null, pierce = false, shieldMul = 1, armorMul = 1, quiet = false, raw = false } = {}) {
+    if (e.dead || e.converted || amount <= 0 || e.phaseT > 0) return 0;
     let dealt = 0;
     if (tower && !raw) {
       if (e.mirror && tower.type === 'laser') amount *= 0.5;
@@ -1052,7 +1480,7 @@ export class Game {
     }
     if (amount > 0) {
       const armor = e.effArmor;
-      if (armor && !pierce) amount = Math.max(amount * 0.25, amount - armor);
+      if (armor && !pierce) amount = Math.max(amount * 0.25, amount * armorMul - armor);
       dealt += Math.min(e.hp, amount);
       e.hp -= amount;
       // Boss skulls: the hull stops at each threshold and the boss triggers its phase ability.
@@ -1085,7 +1513,7 @@ export class Game {
   }
 
   checkRank(t) {
-    while (t.rank < VET.xp.length && t.xp >= VET.xp[t.rank]) {
+    while (t.rank < VET.xp.length && t.xp >= VET.xp[t.rank] * (t.isHero ? HERO_RULES.xpScale : 1)) {
       t.rank++;
       t.refresh();
       this.fx.emit({ type: 'rankup', tower: t, rank: t.rank });
@@ -1146,7 +1574,7 @@ export class Game {
     if (e.type === 'titan') {
       // EMP vent: knocks out every tower nearby (firewalls don't help against a raw pulse), then surges forward.
       const r = 3.2 * TILE;
-      for (const t of this.towers) {
+      for (const t of this.units) {
         if ((t.x - e.x) ** 2 + (t.y - e.y) ** 2 <= (r + TILE * t.size * 0.5) ** 2) this.jamTower(t, 3.5, 'emp');
       }
       e.surgeT = 3;
@@ -1169,7 +1597,11 @@ export class Game {
         e.spawnEvery *= 0.5;
       }
     }
-    this.hooks.bossPhase(e, n);
+    // Adaptation: each skull hardens the boss with variant buffs; by its last one it carries nearly all of them.
+    const buffs = (e.def.phaseBuffs?.[n - 1] || []).filter((m) => !e.mods.includes(m));
+    for (const m of buffs) e.applyMod(m, true);
+    if (buffs.length) this.fx.emit({ type: 'adapt', enemy: e, mods: buffs });
+    this.hooks.bossPhase(e, n, buffs);
   }
 
   // ---------------------------------------------------------------- data couriers
@@ -1217,7 +1649,7 @@ export class Game {
       pk.seg = q.seg; pk.x = q.x; pk.y = q.y;
       // Another courier on its way in snatches it and turns back.
       for (const e of this.enemies) {
-        if (e.dead || !e.def.courier || e.carrying || (e.x - pk.x) ** 2 + (e.y - pk.y) ** 2 > (0.6 * TILE) ** 2) continue;
+        if (e.dead || e.converted || !e.def.courier || e.carrying || (e.x - pk.x) ** 2 + (e.y - pk.y) ** 2 > (0.6 * TILE) ** 2) continue;
         pk.done = true;
         e.carrying = true;
         e.dir = -1;
@@ -1302,7 +1734,7 @@ export class Game {
   blast(tower, x, y, r, dmg, color, main) {
     const s = tower.stats;
     for (const e of [...this.enemies]) {
-      if (e.dead || (e.flying && !s.air)) continue;
+      if (e.dead || e.converted || (e.flying && !s.air)) continue;
       const d = Math.hypot(e.x - x, e.y - y);
       if (d > r + e.radius * 0.5) continue;
       let hit = dmg * (1 - 0.5 * Math.min(1, d / r));
@@ -1315,6 +1747,117 @@ export class Game {
     if (main) this.hooks.sfx('plasmahit', { x });
   }
 
+  // ---------------------------------------------------------------- hero: hijack, traps, missiles
+  // Hijack: the enemy leaves its wave (paid and counted as a kill now), turns around and fights for the hero.
+  convert(e, hero) {
+    const reward = e.reward + (hero.stats.bounty || 0);
+    this.credits += reward;
+    this.stats.earned += reward;
+    this.stats.kills++;
+    this.stats.converted++;
+    hero.kills++;
+    this.waveAlive.set(e.waveId, this.waveAlive.get(e.waveId) - 1);
+    e.uncounted = true;
+    if (e.carrying) { this.dropPacket(e); e.carrying = false; }
+    const life = hero.stats.convertLife;
+    e.converted = { t: life, max: life, cd: 0.3, hero };
+    e.dir = -1;
+    e.stunT = e.slowT = e.burnT = e.frozenT = e.markT = 0;
+    e.cloaked = false;
+    e.revealed = true;
+    e.updatePos();
+    this.fx.text(e.x, e.y - e.radius - 4, `+${reward}¢`, HERO_RULES.hackColor, 12);
+    this.fx.emit({ type: 'convert', enemy: e });
+  }
+
+  // A hijacked enemy shoots the nearest hostile near it for a share of its own hull (credited to the hero).
+  convertZap(e) {
+    const R = HERO_RULES, hero = e.converted.hero, r = R.convertRange * TILE;
+    let best = null, bd = r * r;
+    for (const o of this.enemies) {
+      if (o === e || o.dead || o.converted) continue;
+      const d = (o.x - e.x) ** 2 + (o.y - e.y) ** 2;
+      if (d < bd) { bd = d; best = o; }
+    }
+    if (!best) return;
+    this.damage(best, Math.max(8, e.maxHp * R.convertZap), { tower: hero, pierce: true });
+    if (!best.dead && hero.stats.convertStun) best.stun(hero.stats.convertStun);
+    this.fx.emit({ type: 'convertzap', from: e, to: best });
+  }
+
+  // Its time is up (or it made it home): it self-destructs among its old squad.
+  detonateConvert(e) {
+    const hero = e.converted.hero, r = 1.2 * TILE, dmg = e.maxHp * HERO_RULES.convertBlast;
+    const emp = hero.stats.convertEmp;
+    e.dead = true;
+    for (const o of [...this.enemies]) {
+      if (o.dead || o.converted || (o.x - e.x) ** 2 + (o.y - e.y) ** 2 > (r + o.radius) ** 2) continue;
+      // Ghost Protocol: the blast is also an EMP (bosses are immune to the hack's tricks).
+      if (emp && !o.def.boss) { o.stun(emp); if (o.shield > 0) o.shield *= 0.5; o.revealed = true; }
+      this.damage(o, dmg, { tower: hero, pierce: true });
+    }
+    this.fx.explosion(e.x, e.y, HERO_RULES.hackColor, e.radius * 1.4);
+    this.fx.emit({ type: 'convertend', enemy: e });
+    this.hooks.sfx('explode', e);
+  }
+
+  updateTraps(dt) {
+    if (!this.traps.length) return;
+    for (const tr of this.traps) {
+      tr.age += dt;
+      if (tr.armT > 0) { tr.armT -= dt; continue; }
+      const trig = 0.35 * TILE;
+      if (this.enemies.some((e) => !e.dead && !e.flying && !e.converted && (e.x - tr.x) ** 2 + (e.y - tr.y) ** 2 <= (trig + e.radius) ** 2)) {
+        this.detonateTrap(tr);
+      }
+    }
+    this.traps = this.traps.filter((t) => !t.done);
+  }
+
+  // A trap going off: splash (EMP traps also stun and halve shields), snare, cluster bomblets and a kill-zone field.
+  detonateTrap(tr) {
+    tr.done = true;
+    this.stats.traps++;
+    const h = tr.hero, s = h.stats, r = s.mineR * TILE, dmg = s.mineDmg * (1 + h.buffDmg);
+    this.trapBlast(h, tr.x, tr.y, r, dmg, tr.emp);
+    for (let i = 0; i < s.mineCluster; i++) {
+      const a = Math.random() * Math.PI * 2, d = (0.5 + Math.random() * 0.7) * TILE;
+      const bx = tr.x + Math.cos(a) * d, by = tr.y + Math.sin(a) * d;
+      this.timers.push({ t: 0.1 + i * 0.07, fn: () => this.trapBlast(h, bx, by, r * 0.55, dmg * 0.4, false, true) });
+    }
+    if (s.mineZone) {
+      this.zones.push({ x: tr.x, y: tr.y, r: r * 0.9, dps: dmg * 0.15, t: s.mineZone, tower: h });
+      this.fx.emit({ type: 'zone', x: tr.x, y: tr.y, r: r * 0.9, life: s.mineZone, color: HERO_RULES.trapColor });
+    }
+    this.fx.emit({ type: 'trapboom', trap: tr, r });
+    this.hooks.sfx(tr.emp ? 'emptrap' : 'mineblast', tr);
+  }
+
+  trapBlast(h, x, y, r, dmg, emp = false, small = false) {
+    const s = h.stats;
+    for (const e of [...this.enemies]) {
+      if (e.dead || e.flying || e.converted) continue;
+      const d = Math.hypot(e.x - x, e.y - y);
+      if (d > r + e.radius * 0.5) continue;
+      if (emp) { e.stun(2); if (e.shield > 0) e.shield *= 0.5; e.revealed = true; }
+      h.hit(this, e, dmg * (1 - 0.4 * Math.min(1, d / r)));
+      if (!e.dead && s.mineSlow) e.applySlow(s.mineSlow, 2.5);
+    }
+    this.fx.explosion(x, y, emp ? '#00f0ff' : HERO_RULES.trapColor, r * (small ? 0.4 : 0.6));
+  }
+
+  // Micro-missile impact: splash on the ground (and on flyers, if it was fired at one).
+  missileHit(p) {
+    const h = p.tower;
+    for (const e of [...this.enemies]) {
+      if (e.dead || e.converted || (e.flying && !p.air)) continue;
+      const d = Math.hypot(e.x - p.tx, e.y - p.ty);
+      if (d > p.splash + e.radius * 0.5) continue;
+      h.hit(this, e, p.dmg * (1 - 0.5 * Math.min(1, d / p.splash)));
+    }
+    this.fx.explosion(p.tx, p.ty, p.color, p.splash * 0.45);
+  }
+
   useAbility(key, x, y) {
     const ab = ABILITIES[key];
     if (!ab || this.cooldowns[key] > 0 || this.state === 'won' || this.state === 'lost') return false;
@@ -1322,7 +1865,7 @@ export class Game {
     if (key === 'emp') {
       const r = ab.radius * TILE;
       for (const e of this.enemies) {
-        if ((e.x - x) ** 2 + (e.y - y) ** 2 > r * r) continue;
+        if (e.converted || (e.x - x) ** 2 + (e.y - y) ** 2 > r * r) continue;
         e.stunT = Math.max(e.stunT, e.def.boss ? 1 : ab.stun);
         if (e.shield > 0) this.damage(e, e.shield, { shieldMul: 1 });
         e.revealed = true;
@@ -1373,13 +1916,14 @@ export class Game {
 
     // Jamming: Signal Jammer fields knock nearby towers offline unless an Intrusion Uplink firewalls them.
     const covers = (u, t) => (u.x - t.x) ** 2 + (u.y - t.y) ** 2 <= (u.range + TILE * t.size * 0.5) ** 2;
-    for (const t of this.towers) t.jamT = Math.max(0, t.jamT - dt);
-    const jammers = this.enemies.filter((e) => e.def.jam && !e.dead && e.stunT <= 0);
+    const units = this.units;
+    for (const t of units) t.jamT = Math.max(0, t.jamT - dt);
+    const jammers = this.enemies.filter((e) => e.def.jam && !e.dead && !e.converted && e.stunT <= 0);
     if (jammers.length) {
       const firewalls = this.towers.filter((u) => u.stats.firewall && u.jamT <= 0);
       for (const e of jammers) {
         const r = e.def.jam.radius * TILE;
-        for (const t of this.towers) {
+        for (const t of units) {
           if ((t.x - e.x) ** 2 + (t.y - e.y) ** 2 > (r + TILE * t.size * 0.5) ** 2) continue;
           if (t.stats.firewall || firewalls.some((u) => covers(u, t))) { t.firewalled = 0.4; continue; }
           if (t.jamT <= 0) this.hooks.jammed(t, e);
@@ -1387,12 +1931,12 @@ export class Game {
         }
       }
     }
-    for (const t of this.towers) if (t.firewalled > 0) t.firewalled -= dt;
+    for (const t of units) if (t.firewalled > 0) t.firewalled -= dt;
 
     // Buffs, auras & reveal (offline towers give nothing)
     const online = this.towers.filter((t) => t.jamT <= 0);
     const uplinks = online.filter((t) => t.type === 'uplink');
-    for (const t of this.towers) {
+    for (const t of units) {
       t.buffDmg = 0; t.buffRate = 0; t.camoGrant = false; t.buffSrc = null;
       for (const u of uplinks) {
         if (u === t) continue;
@@ -1408,6 +1952,7 @@ export class Game {
     const auras = online.filter((t) => t.stats.auraDps || t.stats.auraSlow || t.stats.auraShieldDrain || t.stats.auraArmorDown || t.stats.auraAmp || t.stats.globalSlow);
     for (const e of this.enemies) {
       e.auraSlow = 0; e.auraAmp = 0; e.auraArmorDown = 0;
+      if (e.converted) continue;
       for (const t of auras) {
         const s = t.stats;
         if (s.globalSlow && !e.thermal) e.auraSlow = Math.max(e.auraSlow, s.globalSlow);
@@ -1437,11 +1982,14 @@ export class Game {
 
     for (const e of this.enemies) if (!e.dead) e.update(dt, this);
     for (const t of this.towers) t.update(dt, this);
+    if (this.hero) this.hero.update(dt, this);
+    this.updateTraps(dt);
     this.updatePackets(dt);
 
     // Projectiles
     for (const p of this.projectiles) {
       p.t += dt;
+      if (p.t >= p.dur && p.kind === 'missile') { p.done = true; this.missileHit(p); continue; }
       if (p.t >= p.dur) {
         p.done = true;
         this.blast(p.tower, p.tx, p.ty, p.splash, p.dmg, p.color, true);
@@ -1478,7 +2026,7 @@ export class Game {
     // Cleanup & wave bookkeeping
     if (this.enemies.some((e) => e.dead)) {
       for (const e of this.enemies) {
-        if (e.dead) this.waveAlive.set(e.waveId, this.waveAlive.get(e.waveId) - 1);
+        if (e.dead && !e.uncounted) this.waveAlive.set(e.waveId, this.waveAlive.get(e.waveId) - 1);
       }
       this.enemies = this.enemies.filter((e) => !e.dead);
     }

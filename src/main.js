@@ -1,5 +1,5 @@
-import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, MODS, VET, REACTIONS, TILE, W, H, computeStats, endlessMutators } from './config.js';
-import { Game, footprintAnchor, coreDamage, AIR_HEAT_WEIGHT } from './game.js';
+import { MAPS, TOWERS, TOWER_ORDER, ENEMIES, ABILITIES, MODS, VET, REACTIONS, HERO, HERO_RULES, TILE, W, H, computeStats, endlessMutators, variantOf, targetsOf } from './config.js';
+import { Game, footprintAnchor, coreDamage, AIR_HEAT_WEIGHT, RELOCK_TIME } from './game.js';
 import { Renderer } from './render.js';
 import { Renderer3D } from './render3d.js';
 import { AssetLibrary } from './assets3d.js';
@@ -11,11 +11,12 @@ const SAVE_KEY = 'neonbreach.save';
 const MODES = [['first', 'FIRST'], ['last', 'LAST'], ['strong', 'STRONG'], ['close', 'CLOSE']];
 // Mortars and Railguns can also hold a manual aim: a ground spot / a firing line (G sets it).
 const AIM_MODE = ['aim', 'AIM'];
-const modesFor = (t) => (t.aimable ? [...MODES, AIM_MODE] : MODES);
+const modesFor = (t) => (t.stats.aimOnly ? [AIM_MODE] : t.aimable ? [...MODES, AIM_MODE] : MODES);
 const ABILITY_ICONS = { emp: '⌁', orbital: '✦', overclock: '⚡' };
 // Portraits rendered from the 3D models in Blender (tools/blender/render_icons.py).
 const towerIcon = (t) => `assets/icons/tower_${t}.webp`;
 const enemyIcon = (t) => `assets/icons/${ENEMIES[t].boss ? 'boss' : 'enemy'}_${t}.webp`;
+const HERO_ICON = 'assets/icons/hero_warbot.webp';
 
 const audio = new AudioManager();
 const titleFx = new TitleFx($('#bgfx'));
@@ -53,8 +54,10 @@ let modalOpen = false;
 let autoT = 0; // countdown to an auto-launched wave
 let introWave = 0; // last wave whose boss got an intro
 let pendingIntro = null; // boss waiting to clear its spawn portal before the intro starts
-// `aiming`: the Mortar / Railgun whose manual aim the next click sets.
-const ui = { hover: null, placing: null, selected: null, selectedEnemy: null, ability: null, shift: false, previewPath: null, aiming: null };
+// `aiming`: the Mortar / Railgun whose manual aim the next click sets. `placeVariant`: the variant new towers of a
+// type are built as (V while placing; remembered for the session).
+// `placingHero`: the hero is being deployed. `moving`: the next click sends the selected hero there (R).
+const ui = { hover: null, placing: null, selected: null, selectedEnemy: null, ability: null, shift: false, previewPath: null, aiming: null, placeVariant: {}, placingHero: false, moving: false };
 
 // ---------------------------------------------------------------- screens
 function show(name) {
@@ -167,15 +170,18 @@ async function startGame(mapIndex) {
     bossSpawn: (e) => {
       if (game === g && settings.intros && !g.endless && introWave !== g.wave) { introWave = g.wave; pendingIntro = e; }
     },
-    bossPhase: (e, n) => {
+    bossPhase: (e, n, buffs = []) => {
       toast(`☠\uFE0E ${e.def.name} // ${e.def.phaseName} ${n}/${e.def.phases.length}`, e.def.color, 3200);
+      if (buffs.length) toast(`${e.def.name} ADAPTS: ${buffs.map((m) => MODS[m].name).join(' + ')}`, MODS[buffs[0]].color, 3600);
       audio.say(e.type === 'titan' ? 'phase_titan' : 'phase_overmind');
     },
     steal: () => { toast('⚠ DATA PACKET STOLEN — STOP THE COURIER', '#3dffc5'); audio.say('data_stolen'); },
     escape: (e) => { toast(`DATA PACKET LOST  −${e.def.courier.packet} INTEGRITY`, '#ff3355'); audio.say('data_escaped'); },
     recover: () => { toast('DATA PACKET RECOVERED', '#39ff14', 1800); audio.say('data_recovered'); },
     jammed: () => audio.say('jammed'),
-    rankUp: (t) => { if (t.rank >= 3) toast(`${towerTitle(t)} PROMOTED // RANK ${VET.numerals[t.rank]} ${VET.names[t.rank]}`, '#ffe600', 2200); },
+    rankUp: (t) => { if (t.rank >= 3 || t.isHero) toast(`${towerTitle(t)} PROMOTED // RANK ${VET.numerals[t.rank]} ${VET.names[t.rank]}`, '#ffe600', 2200); },
+    heroDown: () => toast(`⚠ ${HERO.name} DOWN // REBOOT IN ${HERO_RULES.downTime}s`, '#ff3355', 3200),
+    heroUp: () => toast(`${HERO.name} BACK ONLINE`, HERO.color, 1800),
     end: (won) => {
       audio.say(won ? 'victory' : 'defeat');
       setTimeout(() => { if (game === g) endScreen(won); }, won ? 900 : 1400);
@@ -183,6 +189,8 @@ async function startGame(mapIndex) {
   });
   game = g;
   ui.placing = null;
+  ui.placingHero = false;
+  ui.moving = false;
   ui.selected = null;
   ui.ability = null;
   paused = false;
@@ -282,7 +290,7 @@ const towerTitle = (t) => (Math.max(...t.tiers) === 5 ? t.def.paths[t.tiers.inde
 
 // End-of-run breakdown: every tower that did damage (sold ones included), plus combos and data couriers.
 function damageReport() {
-  const rows = [...game.towers.map((t) => ({ type: t.type, tiers: t.tiers, rank: t.rank, dmg: t.dmgDealt, kills: t.kills, def: t.def })),
+  const rows = [...game.units.map((t) => ({ type: t.type, tiers: t.tiers, rank: t.rank, dmg: t.dmgDealt, kills: t.kills, def: t.def, hero: t.isHero })),
     ...game.retired.map((r) => ({ ...r, def: TOWERS[r.type] }))]
     .filter((r) => r.dmg > 0 || r.kills > 0).sort((a, b) => b.dmg - a.dmg);
   if (!rows.length) return '';
@@ -291,7 +299,7 @@ function damageReport() {
   const html = top.map((r, i) => {
     const title = Math.max(...r.tiers) === 5 ? r.def.paths[r.tiers.indexOf(5)].tiers[4].name : r.def.name;
     return `<div class="rep-row${r.sold ? ' sold' : ''}" style="--c:${r.def.color}">
-      <img src="${towerIcon(r.type)}" alt="">
+      <img src="${r.hero ? HERO_ICON : towerIcon(r.type)}" alt="">
       <div class="rep-name">${title}${i === 0 ? '<span class="mvp">MVP</span>' : ''}<small>${r.tiers.join('-')}${r.rank ? ` · RANK ${VET.numerals[r.rank]}` : ''}${r.sold ? ' · SOLD' : ''}</small></div>
       <div class="rep-bar"><i style="width:${(r.dmg / top[0].dmg) * 100}%"></i></div>
       <b>${fmtNum(r.dmg)}<small>${Math.round((r.dmg / total) * 100)}% · ${r.kills} kill${r.kills === 1 ? '' : 's'}</small></b></div>`;
@@ -299,9 +307,11 @@ function damageReport() {
   const st = game.stats;
   const combos = Object.entries(st.reactions).sort((a, b) => b[1] - a[1])
     .map(([k, n]) => `<span><b style="color:${REACTIONS[k].color}">${REACTIONS[k].name}</b> ×${fmtNum(n)}</span>`).join('');
+  const heroLine = game.hero && (st.converted || st.traps)
+    ? `<span style="color:${HERO.color}">${HERO.name}: ${st.converted ? `${st.converted} enemies hijacked` : ''}${st.converted && st.traps ? ' · ' : ''}${st.traps ? `${st.traps} traps sprung` : ''}${game.hero.downs ? ` · knocked out ${game.hero.downs}×` : ''}</span>` : '';
   const data = st.stolen ? `<span>DATA PACKETS: ${st.stolen} stolen · ${st.recovered} recovered · <b style="color:${st.escaped ? 'var(--red)' : 'var(--green)'}">${st.escaped} lost</b></span>` : '';
   return `<h4>DAMAGE REPORT</h4><div class="report">${html}</div>
-    ${combos ? `<div class="rep-sum">${combos}</div>` : ''}${data ? `<div class="rep-sum">${data}</div>` : ''}`;
+    ${combos ? `<div class="rep-sum">${combos}</div>` : ''}${data ? `<div class="rep-sum">${data}</div>` : ''}${heroLine ? `<div class="rep-sum">${heroLine}</div>` : ''}`;
 }
 
 // ---------------------------------------------------------------- boss bars
@@ -309,11 +319,13 @@ let bossKey = '';
 function updateBossBars(force) {
   const wrap = $('#boss-bars');
   const bosses = game ? game.enemies.filter((e) => e.def.boss && !e.dead).slice(0, 3) : [];
-  const key = bosses.map((e) => e.id).join(',');
+  const key = bosses.map((e) => `${e.id}:${e.mods.join('+')}`).join(',');
   if (key !== bossKey || force) {
     bossKey = key;
+    // Buffs a boss has adapted, as small colored chips after its name.
+    const chips = (e) => e.mods.map((m) => `<b style="--vc:${MODS[m].color}" title="${MODS[m].name}: ${MODS[m].desc}">${MODS[m].glyph}</b>`).join('');
     wrap.innerHTML = bosses.map((e) => `<div class="boss-bar" data-id="${e.id}" style="--c:${e.def.color}">
-      <div class="bb-head"><span>${e.def.name}</span><small class="bb-skulls"></small></div>
+      <div class="bb-head"><span>${e.def.name}<span class="bb-mods">${chips(e)}</span></span><small class="bb-skulls"></small></div>
       <div class="bb-track"><div class="bb-fill"></div>${e.def.phases.map((f) => `<i style="left:${f * 100}%"></i>`).join('')}</div>
       ${e.maxShield ? '<div class="bb-shield"><div></div></div>' : ''}</div>`).join('');
   }
@@ -366,6 +378,15 @@ function updateHud() {
 
   for (const el of document.querySelectorAll('.shop-item')) {
     const t = el.dataset.type;
+    if (t === 'hero') {
+      el.classList.toggle('poor', !game.hero && game.credits < HERO.cost);
+      el.classList.toggle('active', ui.placingHero || (!!game.hero && ui.selected === game.hero));
+      el.classList.toggle('down', !!game.hero && game.hero.downT > 0);
+      const label = !game.hero ? `${HERO.cost}¢` : game.hero.downT > 0 ? `OFFLINE ${Math.ceil(game.hero.downT)}s` : 'SELECT';
+      const c = el.querySelector('.cost');
+      if (c.textContent !== label) c.textContent = label;
+      continue;
+    }
     el.classList.toggle('poor', game.credits < TOWERS[t].cost);
     el.classList.toggle('active', ui.placing === t);
   }
@@ -386,14 +407,20 @@ function updateHud() {
     const size = TOWERS[ui.placing].size || 1;
     const a = h && h.tx >= 0 ? footprintAnchor(size, h.x, h.y) : null;
     const v = a && r3d.heatAt(ui.placing, a.tx, a.ty);
+    const pdef = TOWERS[ui.placing], pv = variantOf(pdef, ui.placeVariant[ui.placing]);
+    const airOnly = pv && pv.hits === 'air';
     const unit = ui.placing === 'uplink' ? 'tower levels in range' : 'tiles of road in view';
     // Anti-air towers also score the sky lane they'd cover (at a lower weight: only drones fly it).
     const air = v && v.air > 0 ? ` + <b style="color:${ENEMIES.drone.color}">${v.air.toFixed(1)}</b> of sky lane` : '';
+    const grade = v ? (v.k > 0.66 ? 'var(--green)' : v.k > 0.33 ? 'var(--yellow)' : 'var(--red)') : '';
     const html = !settings.heatmap ? 'Heat map off (H)' : v
-      ? `<b style="color:${v.k > 0.66 ? 'var(--green)' : v.k > 0.33 ? 'var(--yellow)' : 'var(--red)'}">${v.road.toFixed(1)}</b> ${unit}${air} · ${Math.round(v.k * 100)}% of the best spot`
-      : TOWERS[ui.placing].air && game.airPaths.length
-        ? `Heat map: green pads cover the most road (sky lane counts ×${AIR_HEAT_WEIGHT})`
-        : 'Heat map: green pads cover the most road';
+      ? airOnly
+        ? `<b style="color:${grade}">${v.air.toFixed(1)}</b> tiles of sky lane in view · ${Math.round(v.k * 100)}% of the best spot`
+        : `<b style="color:${grade}">${v.road.toFixed(1)}</b> ${unit}${air} · ${Math.round(v.k * 100)}% of the best spot`
+      : airOnly ? 'Heat map: green pads see the most sky lane'
+        : targetsOf(pdef, pdef.base).air && game.airPaths.length
+          ? `Heat map: green pads cover the most road (sky lane counts ×${AIR_HEAT_WEIGHT})`
+          : 'Heat map: green pads cover the most road';
     if (hl.dataset.h !== html) { hl.dataset.h = html; hl.innerHTML = html; }
   }
 }
@@ -413,6 +440,15 @@ function buildShop() {
     el.addEventListener('mouseleave', () => { ui.shopHover = null; renderInfo(true); });
     shop.appendChild(el);
   });
+  const el = document.createElement('button');
+  el.className = 'shop-item hero';
+  el.dataset.type = 'hero';
+  el.style.setProperty('--c', HERO.color);
+  el.innerHTML = `<img src="${HERO_ICON}" alt=""><div><div class="nm">${HERO.name} <span class="fp">HERO</span></div><div class="cost">${HERO.cost}¢</div></div><kbd>${HERO.hotkey}</kbd>`;
+  el.addEventListener('click', () => selectHero());
+  el.addEventListener('mouseenter', () => { ui.shopHover = 'hero'; renderInfo(true); });
+  el.addEventListener('mouseleave', () => { ui.shopHover = null; renderInfo(true); });
+  shop.appendChild(el);
 }
 
 function buildAbilities() {
@@ -472,7 +508,7 @@ let infoKey = '';
 const PATH_KEYS = [',', '.', '/'];
 
 // Stat block for a tower; `n` (optional) is the stat set after a hovered upgrade, shown as "→ new".
-function statRows(def, s, n = null, placed = false) {
+function statRows(def, s, n = null, placed = false, variant = null) {
   const r1 = (v) => Math.round(v * 10) / 10;
   const pct = (v) => `${Math.round(v * 100)}%`;
   const row = (label, key, fmt, show) => {
@@ -482,7 +518,7 @@ function statRows(def, s, n = null, placed = false) {
     return `<dt>${label}</dt><dd>${fmt(v, s)}${up}</dd>`;
   };
   const always = () => true, pos = (v) => v > 0, multi = (v) => v > 1;
-  const air = def.air || s.air || n?.air;
+  const hits = targetsOf(def, n || s, variant);
   return `<dl class="stat-grid">
     ${def.base.dmg != null ? row('DAMAGE', 'dmg', (v) => Math.round(v), always) : ''}
     ${def.base.rate != null ? row('RATE', 'rate', (v) => `${r1(v)}/s`, always) : ''}
@@ -497,7 +533,7 @@ function statRows(def, s, n = null, placed = false) {
     ${row('DMG BUFF', 'buffDmg', (v) => `+${pct(v)}`, pos)}
     ${row('RATE BUFF', 'buffRate', (v) => `+${pct(v)}`, pos)}
     ${row('INCOME', 'income', (v) => `+${v}¢/wave`, pos)}
-    <dt>HITS</dt><dd>${def === TOWERS.uplink ? 'SUPPORT' : air && def.ground ? 'AIR + GROUND' : def.ground ? 'GROUND' : 'AIR'}</dd>
+    <dt>HITS</dt><dd>${def === TOWERS.uplink ? 'SUPPORT' : hits.air && hits.ground ? 'AIR + GROUND' : hits.ground ? 'GROUND' : 'AIR'}</dd>
     ${placed ? '' : `<dt>FOOTPRINT</dt><dd>${def.size || 1}×${def.size || 1}</dd>`}
   </dl>${traitChips(s, n)}`;
 }
@@ -511,6 +547,11 @@ const TRAITS = [
   ['FIREWALL', (s) => s.firewall],
   ['ARMOR ↓', (s) => s.auraArmorDown > 0], ['DMG AMP', (s) => s.auraAmp > 0], ['LEECH', (s) => s.auraShieldDrain > 0],
   ['SLOW FIELD', (s) => s.auraSlow > 0], ['BOUNTY', (s) => s.bounty > 0 || s.killBounty > 0], ['AIR', (s) => s.air],
+  ['½ VS SHIELDS', (s) => s.shieldMul < 1], ['½ VS ARMOR', (s) => s.armorMul < 1], ['FIXED LINE', (s) => s.aimOnly],
+  // Hero
+  ['HACK', (s) => s.hackEvery > 0 && !s.convert], ['HIJACK', (s) => s.convert > 0], ['HIJACK EMP', (s) => s.convertEmp > 0],
+  ['ARMOR PIERCE', (s) => s.pierceArmor], ['MISSILES', (s) => s.missiles > 0], ['MINES', (s) => s.mines > 0], ['SNARE', (s) => s.mineSlow > 0],
+  ['EMP TRAPS', (s) => s.empTrap > 0], ['CLUSTER MINES', (s) => s.mineCluster > 0], ['KILL ZONE', (s) => s.mineZone > 0],
 ];
 
 function traitChips(s, n) {
@@ -537,13 +578,13 @@ function pathCard(t, p, i) {
 const COUNTERS = {
   runner: 'Anything works — Pulse Lasers are the most cost-efficient answer.',
   drone: 'Airborne: Lasers, Tesla, Cryo and Railguns hit it. Plasma Mortars cannot.',
-  brute: 'Armor blunts weak hits. Railguns ignore armor; heavy Plasma shells punch through.',
-  aegis: 'Shield regenerates after 2s without damage. Tesla deals 3× to shields; EMP strips them; Railgun slugs do half.',
+  brute: 'Armor blunts weak hits and halves Pulse Lasers until it\'s stripped (Armor Shred, ICE Breaker). Railguns ignore armor; heavy Plasma shells punch through.',
+  aegis: 'Shield regenerates after 2s without damage. Tesla deals 3× to shields; EMP strips them; Railgun slugs and Pulse Lasers do half.',
   phantom: 'Always cloaked: needs camo detection (Laser Hack, Rail Thermal Scope, Hive Mind) or a Netrunner Uplink field. EMP and freezes expose it; cryo and splash still hit it.',
   splitter: 'Bursts into 3 Nano-Mites — keep splash or chain damage behind it.',
   mite: 'Fast and fragile — Tesla chains and Cryo pulses sweep them up.',
-  medic: 'Heals everything around it. Kill it first: STRONG/CLOSE targeting or a Railgun line.',
-  jammer: 'Knocks out towers within 1.8 tiles. Out-range it (Railgun, Mortar), stun it (EMP, freezes) to drop the field, or firewall towers with an Uplink on the Intrusion path.',
+  medic: 'Airborne: heals everything around it. Kill it first with anti-air (AA lasers, Tesla, Railgun), STRONG/CLOSE targeting helps.',
+  jammer: 'Airborne: knocks out towers within 1.8 tiles. Out-range it (Railgun, AA laser), stun it (EMP, freezes) to drop the field, or firewall towers with an Uplink on the Intrusion path.',
   courier: 'Only hurts you if it escapes with a packet: towers near the exit get a second shot. FIRST targeting prioritises carriers about to escape.',
   titan: 'Boss with heavy armor. Railguns, Orbital Strike and EMP (1s stun on bosses).',
   overmind: 'Shielded, armored and launches drones. Tesla for the shield, Railguns for the hull, save the Orbital Strike.',
@@ -581,6 +622,7 @@ function enemyPanelHtml(e) {
       <dt>BOUNTY</dt><dd>${e.reward}¢</dd>
       <dt>CORE DMG</dt><dd id="ei-core"></dd>
       <dt>TO CORE</dt><dd id="ei-dist"></dd>
+      ${game.hero ? `<dt>VS HERO</dt><dd>${d.atk ? `fires at ${d.atk.range} tiles` : 'unarmed'}</dd>` : ''}
       <dt>STATUS</dt><dd id="ei-status"></dd>
     </dl>
     <p>${d.desc || ''}</p>
@@ -637,6 +679,19 @@ function cycleTargeting() {
   audio.play('click');
 }
 
+// Tower variants (V): cycle the selected tower's (it re-locks for a moment), or while placing, the one to build.
+function switchVariant(t = ui.selected) {
+  const type = ui.placing || t?.type;
+  const def = type && TOWERS[type];
+  if (!def?.variants) return;
+  const cur = ui.placing ? variantOf(def, ui.placeVariant[type]) : t.variantDef;
+  const next = def.variants[(def.variants.indexOf(cur) + 1) % def.variants.length];
+  if (ui.placing) ui.placeVariant[type] = next.id;
+  else if (game.setVariant(t, next.id)) toast(`${towerTitle(t)} // ${next.name}`, def.color, 1400);
+  audio.play('click');
+  renderInfo(true);
+}
+
 // Manual aim (G): the next click on the board sets the Mortar's target spot or the Railgun's firing line.
 function beginAim(t = ui.selected) {
   if (!t || !t.aimable) return;
@@ -647,6 +702,96 @@ function beginAim(t = ui.selected) {
   audio.play('click');
   toast(t.type === 'plasma' ? 'CLICK A SPOT FOR THE MORTAR TO SHELL' : 'CLICK TO SET THE RAILGUN\'S FIRING LINE', t.def.color, 2000);
   renderInfo(true);
+}
+
+// ---- hero inspector
+function heroStatRows(s, n, maxHp) {
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const row = (label, key, fmt, show = () => true) => {
+    const v = s[key], nv = n ? n[key] : v;
+    if (!show(v) && !show(nv)) return '';
+    const up = n && nv !== v ? ` <span class="up">→ ${fmt(nv, n)}</span>` : '';
+    return `<dt>${label}</dt><dd>${fmt(v, s)}${up}</dd>`;
+  };
+  const pos = (v) => v > 0, multi = (v) => v > 1;
+  return `<dl class="stat-grid">
+    ${row('DAMAGE', 'dmg', (v) => Math.round(v))}
+    ${row('RATE', 'rate', (v) => `${r1(v)}/s`)}
+    ${row('RANGE', 'range', r1)}
+    ${row('TARGETS', 'targets', (v) => v, multi)}
+    <dt>HULL</dt><dd>${Math.round(maxHp)}</dd>
+    ${row('SPEED', 'speed', (v) => `${r1(v)} tiles/s`)}
+    ${row('HACK', 'hackEvery', (v, st) => (st.convert ? `hijacks ${st.convert} / ${v}s` : `every ${v}s`), pos)}
+    ${row('MISSILES', 'missiles', (v, st) => `${v} / ${st.missileEvery}s`, pos)}
+    ${row('TRAPS', 'mines', (v, st) => `${v} × ${Math.round(st.mineDmg)} dmg`, pos)}
+    <dt>HITS</dt><dd>AIR + GROUND</dd>
+  </dl>${traitChips(s, n)}`;
+}
+
+function heroPreviewHtml() {
+  const s = computeStats(HERO, [0, 0, 0]);
+  return `<div class="enemy-head"><img src="${HERO_ICON}" alt=""><div><h3>${HERO.name}</h3>
+      <div class="lvl">HERO WAR BOT · ${HERO.cost}¢ · HOTKEY ${HERO.hotkey}</div></div></div>
+    <p>${HERO.desc}</p>
+    ${heroStatRows(s, null, HERO.base.hp)}
+    <div class="hero-paths">${HERO.paths.map((p) => `<div style="--pc:${p.color}"><b>${p.name}</b>${p.tiers.map((t) => t.name).join(' › ')}</div>`).join('')}</div>
+    ${ui.placingHero ? '<div class="aim-hint">Click open ground or road to deploy it. Right-click cancels.</div>' : ''}`;
+}
+
+function renderHero(h, force) {
+  const panel = $('#info');
+  const afford = [0, 1, 2].map((i) => (h.nextTier(i) && game.credits >= h.nextTier(i).cost ? 1 : 0)).join('');
+  const key = `hero|${h.tiers.join('')}|${h.mode}|${afford}|${ui.previewPath}|${h.rank}|${ui.moving}`;
+  if (key !== infoKey || force) {
+    infoKey = key;
+    let preview = null;
+    if (ui.previewPath != null && h.nextTier(ui.previewPath) && h.canUpgrade(ui.previewPath)) {
+      const tiers = [...h.tiers];
+      tiers[ui.previewPath]++;
+      preview = computeStats(HERO, tiers, h.rank);
+    }
+    panel.style.setProperty('--c', HERO.color);
+    panel.innerHTML = `
+      <div class="enemy-head"><img src="${HERO_ICON}" alt=""><div>
+        <h3>${towerTitle(h)}</h3>
+        <div class="lvl">HERO · PATHS ${h.tiers.join('-')}</div>
+        <div class="lvl">KILLS <b id="info-kills">${h.kills}</b> · DEALT <b id="info-dmg">${fmtNum(h.dmgDealt)}</b></div></div></div>
+      <div class="bar-row"><span>HULL</span><div class="ebar"><div id="hi-hp" class="efill"></div></div><b id="hi-hpv"></b></div>
+      <div class="bar-row"><span>STATUS</span><span id="hi-status" class="hi-status"></span><span></span></div>
+      <div class="rank-row" id="rank-row">${rankRow(h)}</div>
+      ${heroStatRows(h.stats, preview, h.maxHp)}
+      <div class="paths">${HERO.paths.map((p, i) => pathCard(h, p, i)).join('')}</div>
+      <div class="actions">
+        <button class="btn target" id="btn-target" title="Targeting priority (T)"><span>◎ ${MODES.find(([m]) => m === h.mode)[1]}</span></button>
+        <button class="btn target aim${ui.moving ? ' on' : ''}" id="btn-move" title="Click where it should go (R), or right-click the board"><span>➤ MOVE</span></button>
+      </div>
+      <div class="aim-hint">${ui.moving ? 'Click where the hero should go.' : 'Right-click the board to move it (or R, then click) · 7 again centers the camera.'} Enemies in range shoot back (heavies and bosses from further out; buildings block their fire); out of fire it self-repairs.</div>`;
+    panel.querySelector('#btn-target').addEventListener('click', () => { cycleTargeting(); renderInfo(true); });
+    panel.querySelector('#btn-move').addEventListener('click', () => beginMove());
+    panel.querySelectorAll('[data-up]').forEach((b) => {
+      const i = Number(b.dataset.up);
+      b.addEventListener('click', () => doUpgrade(i));
+      b.addEventListener('mouseenter', () => { ui.previewPath = i; renderInfo(false); });
+      b.addEventListener('mouseleave', () => { ui.previewPath = null; renderInfo(false); });
+    });
+  }
+  // Live readouts.
+  const k = h.maxHp ? h.hp / h.maxHp : 0;
+  const fill = panel.querySelector('#hi-hp');
+  if (!fill) return;
+  fill.style.width = `${(h.downT > 0 ? 1 - h.downT / HERO_RULES.downTime : k) * 100}%`;
+  fill.style.background = h.downT > 0 ? 'var(--red)' : k > 0.5 ? 'var(--cyan)' : k > 0.25 ? 'var(--yellow)' : 'var(--red)';
+  panel.querySelector('#hi-hpv').textContent = `${Math.round(h.hp)}/${Math.round(h.maxHp)}`;
+  const st = h.downT > 0 ? `<span style="color:var(--red)">OFFLINE · REBOOT IN ${Math.ceil(h.downT)}s</span>`
+    : h.rebootT > 0 ? `<span style="color:var(--cyan)">BOOTING</span>`
+      : [h.jamT > 0 && `<span style="color:#ff4f86">${h.jamKind === 'emp' ? 'EMP' : 'JAMMED'} · NO CONTROL</span>`, h.contact > 0 && `<span style="color:var(--red)">UNDER FIRE ×${h.contact}</span>`,
+        h.moving && '<span style="color:var(--cyan)">MOVING</span>', h.engaged && '<span style="color:var(--yellow)">ENGAGED</span>'].filter(Boolean).join(' · ') || 'ONLINE';
+  const se = panel.querySelector('#hi-status');
+  if (se.dataset.h !== st) { se.dataset.h = st; se.innerHTML = st; }
+  const kk = panel.querySelector('#info-kills'), d = panel.querySelector('#info-dmg'), r = panel.querySelector('#rank-row');
+  if (kk) kk.textContent = h.kills;
+  if (d) d.textContent = fmtNum(h.dmgDealt);
+  if (r) { const html = rankRow(h); if (r.dataset.h !== html) { r.dataset.h = html; r.innerHTML = html; } }
 }
 
 function renderInfo(force) {
@@ -669,11 +814,17 @@ function renderInfo(force) {
     return;
   }
   const sel = ui.selected;
+  if (sel?.isHero) { renderHero(sel, force); return; }
+  if (!sel && (ui.placingHero || ui.shopHover === 'hero')) {
+    const key = `prevhero|${ui.placingHero}`;
+    if (key !== infoKey || force) { infoKey = key; panel.style.setProperty('--c', HERO.color); panel.innerHTML = heroPreviewHtml(); }
+    return;
+  }
   const previewType = ui.shopHover || ui.placing;
   const afford = sel ? [0, 1, 2].map((i) => (sel.nextTier(i) && game.credits >= sel.nextTier(i).cost ? 1 : 0)).join('') : '';
   const key = sel
-    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}|${sel.rank}|${sel.fresh}|${ui.aiming === sel}`
-    : previewType ? `prev|${previewType}` : 'empty';
+    ? `sel|${sel.id}|${sel.tiers.join('')}|${sel.mode}|${afford}|${ui.previewPath}|${sel.rank}|${sel.fresh}|${ui.aiming === sel}|${sel.variant}`
+    : previewType ? `prev|${previewType}|${ui.placeVariant[previewType]}|${!!ui.placing}` : 'empty';
   if (key !== infoKey || force) {
     infoKey = key;
     if (sel) {
@@ -682,7 +833,7 @@ function renderInfo(force) {
       if (ui.previewPath != null && sel.nextTier(ui.previewPath) && sel.canUpgrade(ui.previewPath)) {
         const tiers = [...sel.tiers];
         tiers[ui.previewPath]++;
-        preview = computeStats(def, tiers, sel.rank);
+        preview = computeStats(def, tiers, sel.rank, sel.variantDef);
       }
       const title = towerTitle(sel);
       const aims = sel.type !== 'uplink' && sel.type !== 'cryo';
@@ -693,11 +844,12 @@ function renderInfo(force) {
         <div class="lvl">${def.name} · PATHS ${sel.tiers.join('-')}</div>
         <div class="lvl">KILLS <b id="info-kills">${sel.kills}</b> · DEALT <b id="info-dmg">${fmtNum(sel.dmgDealt)}</b></div>
         <div class="rank-row" id="rank-row">${rankRow(sel)}</div>
-        ${statRows(def, sel.stats, preview, true)}
+        ${statRows(def, sel.stats, preview, true, sel.variantDef)}
         ${comboChips(sel.type)}
         <div class="paths">${def.paths.map((p, i) => pathCard(sel, p, i)).join('')}</div>
-        <div class="actions${aims ? '' : ' one'}${sel.aimable ? ' aimable' : ''}">
+        <div class="actions${aims ? '' : ' one'}${sel.aimable || def.variants ? ' aimable' : ''}">
           ${aims ? `<button class="btn target" id="btn-target" title="Targeting priority (T)"><span>◎ ${modesFor(sel).find(([m]) => m === sel.mode)[1]}</span></button>` : ''}
+          ${def.variants ? `<button class="btn target variant" id="btn-variant" title="${sel.variantDef.desc} Switch variant (V): the turret re-locks for ${RELOCK_TIME}s."><span>⇅ ${sel.variantDef.name}</span></button>` : ''}
           ${sel.aimable ? `<button class="btn target aim${ui.aiming === sel ? ' on' : ''}" id="btn-aim" title="${sel.type === 'plasma' ? 'Shell a ground spot of your choice (G)' : 'Fire down a line of your choice (G)'}"><span>⌖ SET AIM</span></button>` : ''}
           <button class="btn sell" id="btn-sell" title="${sellTip}"><span>SELL +${sel.sellValue}¢${sel.fresh ? ' <i class="fresh">FULL</i>' : ''}</span></button>
         </div>
@@ -705,6 +857,7 @@ function renderInfo(force) {
       panel.querySelector('#btn-sell').addEventListener('click', () => doSell());
       panel.querySelector('#btn-target')?.addEventListener('click', () => { cycleTargeting(); renderInfo(true); });
       panel.querySelector('#btn-aim')?.addEventListener('click', () => beginAim(sel));
+      panel.querySelector('#btn-variant')?.addEventListener('click', () => switchVariant(sel));
       panel.querySelectorAll('[data-up]').forEach((b) => {
         const i = Number(b.dataset.up);
         b.addEventListener('click', () => doUpgrade(i));
@@ -714,7 +867,9 @@ function renderInfo(force) {
     } else if (previewType) {
       const def = TOWERS[previewType];
       panel.style.setProperty('--c', def.color);
-      panel.innerHTML = `<h3>${def.name}</h3><div class="lvl">${def.cost}¢ · HOTKEY ${TOWER_ORDER.indexOf(previewType) + 1}</div><p>${def.desc}</p>${statRows(def, computeStats(def, [0, 0, 0]))}
+      const pv = variantOf(def, ui.placeVariant[previewType]);
+      const variantLine = pv ? `<div class="variant-line">VARIANT <b>${pv.name}</b> · ${pv.desc}${ui.placing ? ' <kbd>V</kbd> switches' : ''}</div>` : '';
+      panel.innerHTML = `<h3>${def.name}</h3><div class="lvl">${def.cost}¢ · HOTKEY ${TOWER_ORDER.indexOf(previewType) + 1}</div><p>${def.desc}</p>${variantLine}${statRows(def, computeStats(def, [0, 0, 0], 0, pv), null, false, pv)}
         ${comboChips(previewType)}
         <div class="path-preview">${def.paths.map((p) => `<span style="color:${p.color}">${p.name}</span>`).join(' · ')}</div>
         ${ui.placing ? '<div class="heat-line" id="heat-line"></div>' : ''}`;
@@ -722,7 +877,8 @@ function renderInfo(force) {
       panel.style.removeProperty('--c');
       panel.innerHTML = `<div class="panel-title">SYSTEM</div><div class="info-empty">
         Select a defense (<b>1–6</b>) and click an empty tile to deploy — the heat map shows where it sees the most road.<br>
-        Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget · <b>G</b> aim a Mortar / Railgun by hand.<br>
+        <b>7</b> deploys the hero war bot: it walks anywhere — select it and <b>right-click</b> to move it.<br>
+        Click a tower to inspect · <b>, . /</b> upgrade its 3 paths · <b>S</b> sell · <b>T</b> retarget · <b>G</b> aim a Mortar / Railgun by hand · <b>V</b> switch a Pulse Laser between Ground and Anti-Air.<br>
         Drones leave the gates but cut the corners on <b>sky lanes</b> (the dashed lines), over the low blocks.<br>
         Buildings block line of sight — a tower's range area only covers what it can see.<br>
         <b>SPACE</b> launches waves — calling early pays a bonus · <b>A</b> auto-launch.<br>
@@ -741,8 +897,9 @@ function renderInfo(force) {
 
 // Veterancy readout: chevrons, rank name and progress to the next rank.
 function rankRow(t) {
-  const next = VET.xp[t.rank];
-  const prev = t.rank ? VET.xp[t.rank - 1] : 0;
+  const k0 = t.isHero ? HERO_RULES.xpScale : 1;
+  const next = VET.xp[t.rank] && VET.xp[t.rank] * k0;
+  const prev = t.rank ? VET.xp[t.rank - 1] * k0 : 0;
   const k = next ? Math.min(1, (t.xp - prev) / (next - prev)) : 1;
   const bonus = t.rank ? ` +${Math.round(VET.dmg * t.rank * 100)}% DMG` : '';
   return `<span class="chev">${t.rank ? chevrons(t.rank) : '·'}</span><div class="xpbar"><div style="width:${Math.round(k * 100)}%"></div></div>
@@ -751,7 +908,7 @@ function rankRow(t) {
 
 // Combos a tower type takes part in (hover for the rule).
 const COMBO_ROLES = {
-  laser: [['thermal', 'Focus: Burn Beam + Cryo'], ['exposed', 'Hack: Armor Shred sets up Railguns']],
+  laser: [['thermal', 'Focus: Burn Beam + Cryo'], ['exposed', 'Hack: Armor Shred sets up Railguns, and lifts the laser\'s own armor penalty']],
   plasma: [['fracture', 'on frozen enemies'], ['thermal', 'Tactical: Napalm + Cryo']],
   tesla: [['superconduct', 'on chilled enemies'], ['overload', 'on burning enemies']],
   cryo: [['thermal', 'chill meets burn'], ['superconduct', 'chill sets up Tesla'], ['fracture', 'freezes set up Mortars']],
@@ -767,6 +924,8 @@ function comboChips(type) {
 // ---------------------------------------------------------------- actions
 function selectBuild(type) {
   audio.play('click');
+  ui.placingHero = false;
+  ui.moving = false;
   ui.ability = null;
   ui.selected = null;
   ui.selectedEnemy = null;
@@ -774,6 +933,49 @@ function selectBuild(type) {
   ui.placing = ui.placing === type ? null : type;
   if (ui.placing && game.credits < TOWERS[type].cost) toast('INSUFFICIENT CREDITS', '#ff3355');
   renderInfo(true);
+}
+
+// Hero (7): deploy it, or select it once it's out (pressed again: the camera centers on it).
+function selectHero() {
+  if (!game) return;
+  audio.play('click');
+  ui.ability = null;
+  ui.aiming = null;
+  ui.placing = null;
+  ui.selectedEnemy = null;
+  ui.moving = false;
+  if (game.hero) {
+    if (ui.selected === game.hero) r3d.focusOn(game.hero.x, game.hero.y);
+    ui.placingHero = false;
+    ui.selected = game.hero;
+  } else {
+    ui.selected = null;
+    ui.placingHero = !ui.placingHero;
+    if (ui.placingHero && game.credits < HERO.cost) toast('INSUFFICIENT CREDITS', '#ff3355');
+  }
+  renderInfo(true);
+}
+
+// R: the next click on the board sends the hero there (selecting it first).
+function beginMove() {
+  if (!game?.hero) return;
+  ui.selected = game.hero;
+  ui.moving = !ui.moving;
+  ui.placing = null;
+  ui.ability = null;
+  ui.aiming = null;
+  audio.play('click');
+  renderInfo(true);
+}
+
+function orderMove(p) {
+  const h = game?.hero;
+  if (!h || p.tx < 0) return false;
+  if (h.downT > 0) { audio.play('error'); toast(`${HERO.name} IS OFFLINE`, '#ff3355', 1400); return true; }
+  if (h.jamT > 0) { audio.play('error'); toast(`${HERO.name} IS ${h.jamKind === 'emp' ? "EMP'D" : 'JAMMED'} // NO CONTROL`, '#ff4f86', 1400); return true; }
+  if (!h.moveTo(game, p.x, p.y)) audio.play('error');
+  else audio.play('heromove', h);
+  return true;
 }
 
 function armAbility(key) {
@@ -784,6 +986,8 @@ function armAbility(key) {
     return;
   }
   ui.placing = null;
+  ui.placingHero = false;
+  ui.moving = false;
   ui.selected = null;
   ui.aiming = null;
   ui.ability = ui.ability === key ? null : key;
@@ -800,6 +1004,10 @@ function doUpgrade(p) {
   else if (t.tiers[p] === 5) {
     banner(tierDef.name, `${t.def.paths[p].name} // EVOLUTION COMPLETE`, false);
     toast(`${tierDef.name} ONLINE`, t.def.paths[p].color);
+    if (t.stats.aimOnly) {
+      if (!t.aiming) t.defaultLine(game);
+      toast('FIXED FIRING LINE // G TO RE-AIM', t.def.paths[p].color, 3200);
+    }
   }
   ui.previewPath = null;
   renderInfo(true);
@@ -807,7 +1015,7 @@ function doUpgrade(p) {
 
 function doSell() {
   const t = ui.selected;
-  if (!t) return;
+  if (!t || t.isHero) return;
   if (t.fresh) toast(`FULL REFUND +${t.sellValue}¢`, '#39ff14', 1400);
   game.sell(t);
   ui.selected = null;
@@ -874,8 +1082,14 @@ canvas.addEventListener('pointermove', (ev) => { ui.hover = toWorld(ev); });
 canvas.addEventListener('pointerleave', () => { ui.hover = null; });
 canvas.addEventListener('contextmenu', (ev) => {
   ev.preventDefault();
-  // Right-drag pans the camera; only a click without a drag cancels.
-  if (!rmbDown || Math.hypot(ev.clientX - rmbDown.x, ev.clientY - rmbDown.y) < 6) cancel();
+  // Right-drag pans the camera; only a click without a drag counts. With the hero selected that click is a move order
+  // (RTS style), otherwise it cancels.
+  if (rmbDown && Math.hypot(ev.clientX - rmbDown.x, ev.clientY - rmbDown.y) >= 6) return;
+  if (game && ui.selected?.isHero && !ui.placing && !ui.ability && !ui.aiming && !ui.placingHero) {
+    const p = toWorld(ev);
+    if (p.tx >= 0) { ui.moving = false; orderMove(p); renderInfo(true); return; }
+  }
+  cancel();
 });
 canvas.addEventListener('pointerdown', (ev) => {
   if (ev.button === 2) rmbDown = { x: ev.clientX, y: ev.clientY };
@@ -896,6 +1110,21 @@ canvas.addEventListener('pointerdown', (ev) => {
     renderInfo(true);
     return;
   }
+  if (ui.placingHero) {
+    if (p.tx < 0 || !game.canDeployHero(p.x, p.y)) { audio.play('error'); toast('THE HERO NEEDS OPEN GROUND OR ROAD', '#ff3355'); return; }
+    if (game.credits < HERO.cost) { audio.play('error'); toast('INSUFFICIENT CREDITS', '#ff3355'); return; }
+    ui.placingHero = false;
+    ui.selected = game.deployHero(p.x, p.y);
+    toast(`${HERO.name} DEPLOYED // RIGHT-CLICK TO MOVE IT`, HERO.color);
+    renderInfo(true);
+    return;
+  }
+  if (ui.moving) {
+    ui.moving = false;
+    orderMove(p);
+    renderInfo(true);
+    return;
+  }
   if (ui.placing) {
     const type = ui.placing;
     const size = TOWERS[type].size || 1;
@@ -904,8 +1133,16 @@ canvas.addEventListener('pointerdown', (ev) => {
     const a = footprintAnchor(size, p.x, p.y);
     if (!game.canPlace(a.tx, a.ty, size)) { audio.play('error'); if (size > 1) toast(`NEEDS A CLEAR ${size}×${size} AREA`, '#ff3355'); return; }
     if (game.credits < TOWERS[type].cost) { audio.play('error'); toast('INSUFFICIENT CREDITS', '#ff3355'); return; }
-    game.build(type, a.tx, a.ty);
+    game.build(type, a.tx, a.ty, ui.placeVariant[type]);
     if (!ev.shiftKey || game.credits < TOWERS[type].cost) ui.placing = null;
+    renderInfo(true);
+    return;
+  }
+  const hero = r3d.pickHero(ev.clientX, ev.clientY, game);
+  if (hero) {
+    ui.selected = hero;
+    ui.selectedEnemy = null;
+    audio.play('click');
     renderInfo(true);
     return;
   }
@@ -925,11 +1162,13 @@ canvas.addEventListener('pointerdown', (ev) => {
 });
 
 function cancel() {
-  // Picking an aim point: back out of just that, keeping the tower selected.
+  // Picking an aim point or a move target: back out of just that, keeping the tower / hero selected.
   if (ui.aiming) { ui.aiming = null; renderInfo(true); return true; }
-  if (ui.ability || ui.placing || ui.selected || ui.selectedEnemy) {
+  if (ui.moving) { ui.moving = false; renderInfo(true); return true; }
+  if (ui.ability || ui.placing || ui.placingHero || ui.selected || ui.selectedEnemy) {
     ui.ability = null;
     ui.placing = null;
+    ui.placingHero = false;
     ui.selected = null;
     ui.selectedEnemy = null;
     renderInfo(true);
@@ -955,6 +1194,7 @@ window.addEventListener('keydown', (ev) => {
   if (r3d.cinematic) return;
   if (r3d.cameraKey(k, true)) { ev.preventDefault(); return; }
   if (k >= '1' && k <= '6') { selectBuild(TOWER_ORDER[Number(k) - 1]); return; }
+  if (k === HERO.hotkey) { selectHero(); return; }
   switch (k) {
     case ' ': ev.preventDefault(); launch(); break;
     case 'escape': if (!cancel()) setPaused(true); break;
@@ -966,6 +1206,8 @@ window.addEventListener('keydown', (ev) => {
     case 's': case 'delete': case 'backspace': doSell(); break;
     case 't': cycleTargeting(); renderInfo(true); break;
     case 'g': beginAim(); break;
+    case 'r': beginMove(); break;
+    case 'v': switchVariant(); break;
     case 'z': r3d.turnView(-1); break;
     case 'x': r3d.turnView(1); break;
     case 'c': r3d.resetView(); break;
@@ -1110,7 +1352,9 @@ function showHowTo() {
   const towerRows = TOWER_ORDER.map((t) => `<img src="${towerIcon(t)}" alt=""><div><b style="--c:${TOWERS[t].color};color:${TOWERS[t].color}">${TOWERS[t].name}</b> — ${TOWERS[t].desc}</div>`).join('');
   const enemyRows = Object.entries(ENEMIES).filter(([, d]) => !d.hidden).map(([k, d]) => `<img src="${enemyIcon(k)}" alt=""><div><b style="color:${d.color}">${d.name}</b> — ${d.desc}</div>`).join('');
   openModal('OPERATOR MANUAL', `
-    <p>Rogue drones and corporate cyborgs are pushing toward the <b>data core</b>. Build defenses along the neon roads. Every hostile that reaches the core drains integrity — lose it all and the district falls. Survive 20 waves to secure it.</p>
+    <p>Rogue drones and corporate cyborgs are pushing toward the <b>data core</b>. Build defenses along the neon roads. Every hostile that reaches the core drains integrity — lose it all and the district falls. Survive all 80 waves to secure it.</p>
+    <h4>CAMPAIGN</h4>
+    <p>Four acts of 20 waves, each ending on a boss: <b>Street Level</b> (1–20) introduces the hostiles one at a time and ends on the first Titan; <b>Corporate Push</b> (21–40) brings couriers, jammers and the first resistant variants, with Titans at 30 and 40; <b>Black ICE</b> (41–60) adds the mutators one by one and ends on the first Overmind; <b>Singularity</b> (61–80) stacks variants into dense rushes and closes with two Overminds and three Titans. Enemy hulls grow steadily; bounties shrink after waves 50 and 60, so the last act is won with the defense you've built. After 80, endless mode keeps going.</p>
     <h4>CONTROLS</h4>
     <ul>
       <li><b>1–6</b> pick a defense, click a tile to deploy (hold <b>Shift</b> to place several)</li>
@@ -1119,6 +1363,7 @@ function showHowTo() {
       <li><b>Sky lanes</b>: Hunter Drones leave the same gates but don't keep to the road: they cut straight across its corners (the dashed lines, brighter when drones are inbound), cruising over the low-rise blocks — only the tall towers hide them from your defenses. While placing or inspecting an anti-air tower, the stretch of lane it covers lights up</li>
       <li>Every tower has <b>3 upgrade paths × 5 tiers</b>. Crosspathing: you can invest in two paths, and only one may go past tier 2 (e.g. 5-2-0)</li>
       <li><b>Space</b> launch next wave — calling it early pays bonus credits</li>
+      <li><b>Tower variants</b> (<b>V</b>): a Pulse Laser is either <b>Ground</b> (ground targets only, +20% damage) or <b>Anti-Air</b> (flyers only, +0.6 range, +40% damage; the turret locks its barrels skyward and sweeps the sky). Switch any time in the inspector: the turret re-locks for ${RELOCK_TIME}s and reloads. While placing, <b>V</b> picks the variant to build</li>
       <li><b>Loading</b>: towers only load while an enemy is in view, so each engagement opens with a load (a Railgun takes almost 3s, a Pulse Laser a quarter second). Slow weapons glow at the muzzle as the charge builds</li>
       <li><b>Buildings block line of sight</b>: lasers, tesla arcs, railgun slugs and cryo pulses can't reach what's behind them. While placing or inspecting a tower, its range area only covers the ground it can see. Plasma mortars lob over buildings; the Railgun's Thermal Scope punches through them</li>
       <li><b>Phantoms are always cloaked</b>: you need camo detection or a Netrunner Uplink field to hit them</li>
@@ -1127,6 +1372,8 @@ function showHowTo() {
       <li><b>F</b> cycle speed (1–4×) · <b>A</b> auto-launch waves · <b>P</b>/<b>Esc</b> pause · <b>M</b> mute · Right-click cancels</li>
       <li><b>Right-drag</b> or <b>arrow keys</b> pan the camera · <b>Mouse wheel</b> zooms toward the cursor · <b>Middle-drag</b> (or <b>Shift</b> + right-drag) or <b>Z</b> / <b>X</b> turn it · <b>C</b> resets the view</li>
     </ul>
+    <h4>HERO WAR BOT</h4>
+    <p><b style="color:${HERO.color}">${HERO.name}</b> (<b>7</b>, ${HERO.cost}¢, one per run) walks anywhere: select it and <b>right-click</b> where it should go (or <b>R</b>, then click). Its twin autocannons hit air and ground and it sees cloaked units. Every armed enemy that has it in range shoots back (runners from 1.7 tiles, heavies 2.3, bosses 3.6–4; buildings block their fire), so where it stands matters; out of fire it self-repairs, and knocked out it reboots after ${HERO_RULES.downTime}s. A Signal Jammer's field or the Titan's EMP freezes it: no orders, no guns, no traps until it clears. It upgrades like a tower (3 paths, same crosspathing, pricier tiers): <b style="color:${HERO.paths[0].color}">ICE BREAKER</b> hacks enemies and from HIJACK turns them against their own squad, <b style="color:${HERO.paths[1].color}">ARSENAL</b> is raw firepower and missile salvos, <b style="color:${HERO.paths[2].color}">TRAPPER</b> plants mines on the road.</p>
     <h4>VETERANCY</h4>
     <p>Towers earn XP for the damage they deal (Cryo also for every enemy it chills; an Uplink takes a quarter of what the towers it buffs earn). Ranks I–V each add +${Math.round(VET.dmg * 100)}% damage and +${Math.round(VET.rate * 100)}% fire rate. Selling a tower loses its rank.</p>
     <h4>COMBOS</h4>

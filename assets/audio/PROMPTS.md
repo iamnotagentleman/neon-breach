@@ -44,5 +44,19 @@ Rapid-fire sounds have several variations; the engine picks one at random (never
 | boss_warning | 1 | 3.0 s | Ominous boss approaching cue, deep cinematic sci-fi braam with low sub pulse and faint digital glitch, no siren |
 | game_over | 1 | 3.0 s | System failure, digital glitch shutdown with descending power-down synth, dramatic and short, cyberpunk |
 | victory | 1 | 3.0 s | Triumphant cyberpunk victory stinger, bright synthwave chord swell with sparkling arpeggio, short |
+| hero_shot | 3 | 0.5 s | Twin heavy autocannon shot from a four-legged combat mech, punchy mechanical bang with a crisp metallic kick and a short electric tail, cyberpunk war robot weapon, short clean game sound |
+| hero_hack | 2 | 0.9 s | Netrunner hack intrusion, glitchy digital data burst with a rising electronic chirp and static crackle, cyberpunk hacking zap, clean game sound |
+| hero_hijack | 1 | 1.4 s | Enemy robot hijacked, stuttering digital glitch and data corruption resolving into a low reprogrammed power-up hum, cyberpunk takeover, clean game sound |
+| trap_set | 2 | 0.6 s | Proximity mine thrown down, heavy metal disc landing with a clunk followed by two quick electronic arming beeps, sci-fi, short |
+| mine_blast | 2 | 1.0 s | Proximity mine detonation, sharp explosive crack with metallic shrapnel and a low boom, sci-fi game sound |
+| emp_trap | 1 | 0.9 s | Small EMP mine going off, sharp electric pop with a descending power-drain whine and crackle, sci-fi |
+| missile_salvo | 2 | 1.0 s | Micro-missile salvo launched from a war mech's back pods, rapid rippling whooshes of several small rockets firing in quick succession, sci-fi |
+| hero_hit | 2 | 0.5 s | Bullets hitting heavy robot armor plating, sharp metallic ricochet pings and clanks, short game sound |
+| hero_down | 1 | 2.0 s | Heavy four-legged combat robot knocked out, electrical overload with sparks, servo whine powering down, metal legs collapsing with a heavy clang |
+| hero_reboot | 1 | 1.8 s | Combat mech rebooting, rising power-up whine with servo motors spinning up, digital boot beeps and a confident mechanical lock-in, cyberpunk |
+| hero_deploy | 1 | 1.5 s | War mech drop deployment, heavy metallic landing thud with a hydraulic hiss and servo whir, brief digital hologram shimmer, cyberpunk |
+| hero_move | 1 | 0.5 s | Mech acknowledging a move order, short servo whirr with a crisp digital chirp, cyberpunk UI, subtle |
+
+The hero war bot's sounds (the `hero_*`, `trap_set`, `mine_blast`, `emp_trap` and `missile_salvo` rows) were added on 2026-09-29, 58.7 credits in total.
 
 The first wave-start cue was a siren; it was replaced by the softer cue above (spectral centroid 3.8 kHz → ~0.6–1.2 kHz).

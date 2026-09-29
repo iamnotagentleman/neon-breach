@@ -42,13 +42,26 @@ const SFX = {
   boss_warning: { key: 'boss_warning', n: 1, gain: 0.7 },
   victory: { key: 'victory', n: 1, gain: 0.8 },
   game_over: { key: 'game_over', n: 1, gain: 0.8 },
+  // Hero war bot.
+  heroshot: { key: 'hero_shot', n: 3, gain: 0.26, maxDur: 0.4, throttle: 0.05, poly: 4, jitter: 0.06 },
+  herohack: { key: 'hero_hack', n: 2, gain: 0.42, maxDur: 0.9, throttle: 0.2, poly: 2, jitter: 0.04 },
+  herohijack: { key: 'hero_hijack', n: 1, gain: 0.5, throttle: 0.2, poly: 2 },
+  trapset: { key: 'trap_set', n: 2, gain: 0.3, throttle: 0.15, poly: 2, jitter: 0.05 },
+  mineblast: { key: 'mine_blast', n: 2, gain: 0.45, maxDur: 1.0, throttle: 0.08, poly: 3, jitter: 0.06 },
+  emptrap: { key: 'emp_trap', n: 1, gain: 0.45, throttle: 0.1, poly: 2 },
+  missile: { key: 'missile_salvo', n: 2, gain: 0.4, throttle: 0.3, poly: 2, jitter: 0.04 },
+  herohit: { key: 'hero_hit', n: 2, gain: 0.2, maxDur: 0.4, throttle: 0.12, poly: 2, jitter: 0.1 },
+  herodown: { key: 'hero_down', n: 1, gain: 0.7 },
+  heroreboot: { key: 'hero_reboot', n: 1, gain: 0.55 },
+  herodeploy: { key: 'hero_deploy', n: 1, gain: 0.6 },
+  heromove: { key: 'hero_move', n: 1, gain: 0.3, throttle: 0.2 },
 };
 
 // Throttles for sounds that only exist as synthesis (or when a sample failed to load).
 const SYNTH_THROTTLE = { hover: 0.04 };
 
 const SETTINGS_KEY = 'neonbreach.audio';
-const WEAPONS = new Set(['laser', 'plasma', 'plasmahit', 'tesla', 'cryo', 'rail', 'pop']);
+const WEAPONS = new Set(['laser', 'plasma', 'plasmahit', 'tesla', 'cryo', 'rail', 'pop', 'heroshot', 'mineblast', 'herohit']);
 
 export class AudioManager {
   constructor() {

@@ -5,3 +5,5 @@ concept/raw/
 # Third-party ArtStation references, used only as a private style moodboard — not for distribution.
 concept/references/
 concept/moodboard.jpg
+# API keys (eachlabs).
+.env

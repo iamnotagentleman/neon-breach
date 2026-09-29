@@ -3,8 +3,10 @@
 // STATS=1 prints damage share by tower type, the final build, couriers, tower ranks and combo counts per run;
 // VERBOSE=1 a per-wave log.
 // STRAT picks the build: mixed (default, every tower) or a focused one from STRATS below (e.g. STRAT=laser).
+// HERO=0|1|2 also deploys the hero war bot early (off the road, where it covers the most) and invests in that path
+// (then 2 tiers of the next one) alongside the towers; before each wave it walks to the best spot again.
 import { Game, AIR_HEAT_WEIGHT } from '../src/game.js';
-import { MAPS, TOWERS, TILE, COLS, ROWS, ABILITIES } from '../src/config.js';
+import { MAPS, TOWERS, ENEMIES, HERO, TILE, COLS, ROWS, ABILITIES, computeStats, variantOf } from '../src/config.js';
 
 const runs = Number(process.argv[2] || 3);
 const skill = Number(process.argv[3] || 1);
@@ -13,8 +15,13 @@ const NOABIL = !!process.env.NOABIL;
 
 // Main path to tier 5, secondary to tier 2 (a typical BTD-style build).
 const PREF = { laser: [0, 2], plasma: [0, 1], tesla: [0, 1], cryo: [0, 2], rail: [0, 1], uplink: [0, 2] };
+const HERO_PATH = process.env.HERO != null && process.env.HERO !== '' ? Number(process.env.HERO) : null;
+if (HERO_PATH != null) PREF.hero = [HERO_PATH, (HERO_PATH + 1) % 3];
 function nextUpgrade(t) {
   const [main, sec] = PREF[t.type];
+  // The hero's capstone costs as much as a small army: its second path's two tiers come first.
+  if (t.isHero && t.tiers[main] < 4 && t.canUpgrade(main)) return main;
+  if (t.isHero && t.tiers[sec] < 2 && t.canUpgrade(sec)) return sec;
   if (t.tiers[main] < 5 && t.canUpgrade(main)) return main;
   if (t.tiers[sec] < 2 && t.canUpgrade(sec)) return sec;
   return -1;
@@ -47,7 +54,12 @@ const STRATS = {
   },
 };
 const STRAT = STRATS[process.env.STRAT || 'mixed'];
-const { plan: PLAN = [], cycle: CYCLE = [] } = STRAT;
+let { plan: PLAN = [], cycle: CYCLE = [] } = STRAT;
+// With a hero: it goes down third, with a hero upgrade every sixth step after that (and once per cycle).
+if (HERO_PATH != null && PLAN.length) {
+  PLAN = PLAN.flatMap((step, i) => (i === 2 ? ['hero', step] : i > 2 && i % 6 === 0 ? ['up:hero', step] : [step]));
+  CYCLE = [...CYCLE, 'up:hero'];
+}
 
 function samples(paths) {
   const pts = [];
@@ -97,12 +109,32 @@ function bestTile(game, type, pts, air, anywhere = false) {
   return best;
 }
 
+// Where the sim's hero stands: open ground (not road) seeing the most road in its range (every stretch counts the
+// same: unlike a tower's, its spot isn't the last line), top part at random if casual.
+function heroSpot(game, pts) {
+  const r = (game.hero ? game.hero.range : HERO.base.range * TILE);
+  const cands = [];
+  for (let ty = 0; ty < ROWS; ty++) for (let tx = 0; tx < COLS; tx++) {
+    if (!game.canPlace(tx, ty, 1) && !(game.hero && Math.floor(game.hero.x / TILE) === tx && Math.floor(game.hero.y / TILE) === ty)) continue;
+    const x = (tx + 0.5) * TILE, y = (ty + 0.5) * TILE;
+    let s = 0;
+    for (const p of pts.road) if ((p.x - x) ** 2 + (p.y - y) ** 2 <= r * r && game.los(x, y, p.x, p.y)) s += 1;
+    if (s > 0) cands.push({ s, x, y });
+  }
+  cands.sort((a, b) => b.s - a.s);
+  if (!cands.length) return null;
+  return CASUAL ? cands[Math.floor(Math.random() * Math.ceil(cands.length * (Number(process.env.TOP) || 0.5)))] : cands[0];
+}
+
+// Units a step can upgrade: the hero for 'hero', otherwise the towers of that type.
+const upgradable = (game, type) => (type === 'hero' ? (game.hero ? [game.hero] : []) : game.towers.filter((o) => o.type === type)).filter((o) => upCost(o) < Infinity);
+
 function spend(game, st, pts) {
   if (STRAT.policy) return spendPolicy(game, pts);
   for (let guard = 0; guard < 40; guard++) {
     let step = PLAN[st.i];
     if (step == null) {
-      const up = game.towers.filter((t) => upCost(t) < Infinity).sort((a, b) => upCost(a) - upCost(b))[0];
+      const up = game.units.filter((t) => upCost(t) < Infinity).sort((a, b) => upCost(a) - upCost(b))[0];
       step = up && game.towers.length >= 14 ? `up:${up.type}` : CYCLE[st.c % CYCLE.length];
     }
     if (game.credits * skill < 0) return;
@@ -110,11 +142,18 @@ function spend(game, st, pts) {
     const [verb, arg] = step.includes(':') ? step.split(':') : [null, step];
     if (verb) {
       const type = arg;
-      const pool = game.towers.filter((o) => o.type === type && upCost(o) < Infinity);
+      const pool = upgradable(game, type);
       const t = verb === 'max' ? pool.sort((a, b) => b.invested - a.invested)[0] : pool.sort((a, b) => upCost(a) - upCost(b))[0];
       if (!t) ok = true; // nothing to upgrade, skip step
       else if (game.credits * skill >= upCost(t)) ok = game.upgrade(t, nextUpgrade(t));
       else return;
+    } else if (step === 'hero') {
+      if (game.hero) ok = true;
+      else {
+        if (game.credits * skill < HERO.cost) return;
+        const spot = heroSpot(game, pts);
+        ok = spot ? !!game.deployHero(spot.x, spot.y) : true;
+      }
     } else {
       if (game.credits * skill < TOWERS[step].cost) return;
       const tile = bestTile(game, step, pts.road, pts.air);
@@ -133,7 +172,7 @@ function doStep(game, step, pts) {
     const tile = bestTile(game, type, pts.road, pts.air);
     return !!tile && !!game.build(type, tile[0], tile[1]);
   }
-  const pool = game.towers.filter((o) => o.type === type && upCost(o) < Infinity);
+  const pool = upgradable(game, type);
   const t = verb === 'max' ? pool.sort((a, b) => b.invested - a.invested)[0] : pool.sort((a, b) => upCost(a) - upCost(b))[0];
   return !!t && game.credits >= upCost(t) && game.upgrade(t, nextUpgrade(t));
 }
@@ -154,6 +193,25 @@ function spendPolicy(game, pts) {
   }
 }
 
+// Towers with variants (Pulse Lasers) are set before each wave: if it brings flyers, the ones that see the most sky
+// lane go anti-air, enough to match the flyers' share of the wave's hull; the rest stay on the ground.
+function setVariants(game, pts) {
+  const flex = game.towers.filter((t) => t.def.variants);
+  if (!flex.length) return;
+  let air = 0, all = 0;
+  for (const g of game.waveDef(game.wave + 1)) {
+    const d = ENEMIES[g.type], hp = (d.hp + (d.shield || 0)) * g.count;
+    all += hp;
+    if (d.flying) air += hp;
+  }
+  const want = air ? Math.max(1, Math.round(flex.length * Math.min(0.6, (air / all) * 1.5))) : 0;
+  const sky = (t) => {
+    const r = computeStats(t.def, t.tiers, 0, variantOf(t.def, 'air')).range * TILE;
+    return pts.air.filter((p) => (p.x - t.x) ** 2 + (p.y - t.y) ** 2 <= r * r && game.los(t.x, t.y, p.x, p.y, true)).length;
+  };
+  [...flex].sort((a, b) => sky(b) - sky(a)).forEach((t, i) => game.setVariant(t, i < want ? 'air' : 'ground'));
+}
+
 function useAbilities(game) {
   if (NOABIL) return;
   const threat = game.enemies.filter((e) => e.remaining < e.path.length * 0.35).sort((a, b) => b.hp - a.hp)[0];
@@ -170,9 +228,11 @@ function play(mapIndex) {
   const st = { i: 0, c: 0 };
   const dt = 1 / 30;
   let t = 0;
-  while (game.state !== 'won' && game.state !== 'lost' && t < 60 * 60) {
+  while (game.state !== 'won' && game.state !== 'lost' && t < 6 * 3600) {
     if (game.state === 'build') {
       spend(game, st, pts);
+      setVariants(game, pts);
+      if (game.hero && !process.env.HERO_STATIC) { const spot = heroSpot(game, pts); if (spot) game.hero.moveTo(game, spot.x, spot.y); }
       log.push({ wave: game.wave + 1, lives: game.lives, credits: Math.floor(game.credits), towers: game.towers.length });
       game.launchWave();
     }
@@ -181,10 +241,11 @@ function play(mapIndex) {
     t += dt;
   }
   const ranks = game.towers.map((tw) => tw.rank).sort().join('');
+  const hero = game.hero ? ` hero:${game.hero.tiers.join('')} r${game.hero.rank} downs=${game.hero.downs} conv=${game.stats.converted} traps=${game.stats.traps}` : '';
   const gs = game.stats;
   const tot = Object.values(gs.dmgByType).reduce((x, y) => x + y, 0) || 1;
   const share = Object.entries(gs.dmgByType).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${k} ${Math.round((v / tot) * 100)}%`).join(' ');
-  const build = game.towers.map((tw) => `${tw.type}:${tw.tiers.join('')}`).join(' ');
+  const build = game.towers.map((tw) => `${tw.type}:${tw.tiers.join('')}`).join(' ') + hero;
   const extra = `damage ${share} | ${build} | stolen=${gs.stolen} escaped=${gs.escaped} recovered=${gs.recovered} ranks=${ranks} combos=${JSON.stringify(gs.reactions)}`;
   return { map: MAPS[mapIndex].name, result: game.state, wave: game.wave, lives: game.lives, towers: game.towers.length, credits: Math.floor(game.credits), time: Math.round(t), log, extra };
 }

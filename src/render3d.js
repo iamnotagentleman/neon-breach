@@ -16,7 +16,7 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
-import { TILE, COLS, ROWS, TOWERS, ENEMIES, ABILITIES, MODS, VET } from './config.js';
+import { TILE, COLS, ROWS, TOWERS, ENEMIES, ABILITIES, MODS, VET, HERO, HERO_RULES, computeStats, variantOf, targetsOf } from './config.js';
 import { ENEMY_VIS, recolorMaterial } from './assets3d.js';
 import { seededRandom, footprintAnchor, segmentBlock, coverageMap, pathPoint } from './game.js';
 
@@ -33,6 +33,8 @@ const DIVE_TILES = 1.8;
 const LANE_LIFT = 0.18;
 // Height the orbital strike's satellite lance comes down from.
 const ORBIT_Y = 30;
+// How far an anti-air variant tilts its turret head up (radians).
+const AA_PITCH = 0.6;
 const flightAlt = (dist, remaining, hover) => hover + (CRUISE_Y - hover)
   * THREE.MathUtils.smoothstep(dist / TILE, 1.2, 3.2) * THREE.MathUtils.smoothstep(remaining / TILE, 0, DIVE_TILES);
 // Model scale per footprint: 2x2 heavies read as big installations, not scaled-up 1x1 towers.
@@ -63,6 +65,12 @@ const lerpAngle = (a, b, k) => {
   let d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
   return a + d * k;
 };
+const wrapAngle = (d) => ((d + Math.PI) % TAU + TAU) % TAU - Math.PI;
+// Hero war bot: model scale (about a tile across) and the ground speed (tiles/s) its run cycle covers at 1x, so the
+// clip can be sped up to match how fast it walks (the run clip's stride is 0.32 model units per 16-frame cycle).
+const HERO_SCALE = 1.1;
+const HERO_RUN_SPEED = (0.32 * HERO_SCALE) / (16 / 24);
+const HERO_ONCE = new Set(['hit', 'death', 'activate']);
 
 function canvasTexture(w, h, draw, srgb = true) {
   const c = document.createElement('canvas');
@@ -119,6 +127,8 @@ export class Renderer3D {
     this.lightPool = [];
     this.shakeT = 0;
     this.packetViews = new Map();
+    this.heroView = null;
+    this.trapViews = new Map();
     this.cine = null; // boss intro camera
     // Player settings: shake 0..1, floating texts, placement heat map.
     this.settings = { shake: 1, texts: true, heatmap: true };
@@ -474,7 +484,19 @@ export class Renderer3D {
     this.aimLine = new Line2(new LineGeometry(), this.aimLineMat);
     this.aimFar = new Line2(new LineGeometry(), this.aimFarMat);
     for (const o of [this.airCover, this.aimRing, this.aimLine, this.aimFar]) { o.frustumCulled = false; o.renderOrder = 7; o.visible = false; this.scene.add(o); }
-    this.uiLineMats = [this.laneMat, this.laneGroundMat, this.airCoverMat, this.aimLineMat, this.aimFarMat];
+    // The hero's move orders: its route as a dashed line on the ground and a ring where it's headed.
+    this.routeMat = new LineMaterial({ color: col(HERO.color).clone().multiplyScalar(1.8), linewidth: 2, dashed: true, dashSize: 0.18, gapSize: 0.14, transparent: true, opacity: 0.85, depthWrite: false, toneMapped: false });
+    this.routeLine = new Line2(new LineGeometry(), this.routeMat);
+    this.routeKey = '';
+    this.destRing = this.rangeRing.clone(true);
+    this.destRing.children.forEach((c) => { c.material = c.material.clone(); });
+    for (const o of [this.routeLine, this.destRing]) { o.frustumCulled = false; o.renderOrder = 7; o.visible = false; this.scene.add(o); }
+    // Hero traps: a small puck with a blinking light, shared across traps.
+    this.trapGeo = new THREE.CylinderGeometry(0.13, 0.16, 0.06, 10);
+    this.trapMat = new THREE.MeshStandardMaterial({ color: '#23242c', metalness: 0.8, roughness: 0.4 });
+    this.trapRingGeo = new THREE.TorusGeometry(0.1, 0.014, 6, 20).rotateX(Math.PI / 2);
+    this.trapRingMats = { mine: new THREE.MeshBasicMaterial({ color: col(HERO_RULES.trapColor).clone().multiplyScalar(2.2), toneMapped: false }), emp: new THREE.MeshBasicMaterial({ color: col('#00f0ff').clone().multiplyScalar(2.2), toneMapped: false }) };
+    this.uiLineMats = [this.laneMat, this.laneGroundMat, this.airCoverMat, this.aimLineMat, this.aimFarMat, this.routeMat];
 
     // Shared geometries/materials for pooled effects.
     this.beamGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
@@ -626,6 +648,14 @@ export class Renderer3D {
       fromT: this.controls.target.clone(), fromP: this.camera.position.clone(),
       toT: this.target.clone(), toP: this.target.clone().addScaledVector(this.camDir, dist),
     };
+  }
+
+  // Glide the view over to game pixel (px, py), keeping the current zoom and angle (centering on the hero).
+  focusOn(px, py) {
+    const off = this.camera.position.clone().sub(this.controls.target);
+    const toT = new THREE.Vector3(wx(px), 0, wz(py));
+    this.turnLeft = 0;
+    this.camReset = { t: 0, fromT: this.controls.target.clone(), fromP: this.camera.position.clone(), toT, toP: toT.clone().add(off) };
   }
 
   // ------------------------------------------------------------------ boss intro camera
@@ -1089,6 +1119,9 @@ export class Renderer3D {
     for (const v of this.shellViews.values()) this.dynGroup.remove(v);
     for (const v of this.packetViews.values()) this.dynGroup.remove(v);
     for (const f of this.fxItems) this.dynGroup.remove(f.obj);
+    if (this.heroView) { this.dynGroup.remove(this.heroView.root); this.heroView = null; }
+    for (const v of this.trapViews.values()) this.dynGroup.remove(v);
+    this.trapViews.clear();
     this.towerViews.clear(); this.enemyViews.clear(); this.shellViews.clear(); this.packetViews.clear();
     this.endCinematic(true);
     this.heat.key = '';
@@ -1122,7 +1155,7 @@ export class Renderer3D {
     ring.position.y = 0.005;
     root.add(ring);
     const flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, color: c.clone().multiplyScalar(4), blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, opacity: 0 }));
-    const v = { root, ring, flash, size, tierKey: '', modelName: '', yaw: yawOf(t.angle), recoil: 0, modules: null, anims: [] };
+    const v = { root, ring, flash, size, tierKey: '', modelName: '', yaw: yawOf(t.angle), pitch: t.variantDef?.hits === 'air' ? AA_PITCH : 0, recoil: 0, modules: null, anims: [] };
     this.setTowerModel(v, t);
     this.dynGroup.add(root);
     return v;
@@ -1160,7 +1193,11 @@ export class Renderer3D {
     v.topY = (tpl ? tpl.size.y : 0.9) * towerScale(v.size, t.level) * 0.92;
     (head || v.root).add(v.flash);
     v.flash.position.copy(head ? muzzle : new THREE.Vector3(0, v.topY, 0));
-    if (head) { head.userData.bx = head.position.x; head.userData.bz = head.position.z; head.rotation.y = v.yaw; }
+    if (head) {
+      head.userData.bx = head.position.x; head.userData.bz = head.position.z;
+      head.rotation.order = 'YXZ'; // yaw, then pitch (anti-air variants tilt up)
+      head.rotation.set(-(v.pitch || 0), v.yaw, 0);
+    }
     const c = col(t.def.color);
     if (t.type === 'tesla') {
       v.light = new THREE.PointLight(c.clone(), 0, 3 * v.size, 2);
@@ -1220,8 +1257,13 @@ export class Renderer3D {
         if (t.type === 'cryo') v.head.rotation.y += dt * (0.8 + t.fireFlash * 8);
         else if (t.type === 'uplink') v.head.rotation.y += dt * 1.6;
         else {
-          v.yaw = lerpAngle(v.yaw, yawOf(t.angle), Math.min(1, dt * 14));
-          v.head.rotation.y = v.yaw;
+          // Anti-air variant: head tilted skyward; with nothing to shoot at, it sweeps the sky around its last bearing.
+          const aa = t.variantDef?.hits === 'air';
+          const scan = aa && !t.engaged;
+          const want = yawOf(t.angle) + (scan ? Math.sin(this.time * 0.7 + t.id * 1.7) * 1.2 : 0);
+          v.yaw = lerpAngle(v.yaw, want, Math.min(1, dt * (scan ? 3 : 14)));
+          v.pitch += ((aa ? AA_PITCH : 0) - v.pitch) * Math.min(1, dt * 3);
+          v.head.rotation.set(-v.pitch, v.yaw, 0);
           v.recoil = Math.max(0, v.recoil - dt * 6);
           const back = v.recoil * 0.07;
           v.head.position.x = v.head.userData.bx - Math.sin(v.yaw) * back;
@@ -1282,6 +1324,8 @@ export class Renderer3D {
       m.traverse((o) => { if (o.isMesh) { o.material = mat; o.castShadow = false; } });
       m.scale.setScalar(towerScale(TOWERS[type].size || 1));
       g.add(m);
+      g.userData.head = m.getObjectByName('head');
+      if (g.userData.head) g.userData.head.rotation.order = 'YXZ';
     }
     g.userData.mat = mat;
     this.scene.add(g);
@@ -1362,6 +1406,24 @@ export class Renderer3D {
     return { root, inner, obj, mixer, action, mats, vis, shield, shieldSize, packet, jamDisc, height, yaw: yawOf(e.angle), cloaked: false, slowed: false, age: 0, healT: Math.random(), jamPulse: Math.random() };
   }
 
+  // Hijacked by the hero: the enemy's neon and armor take the hack color for the rest of its short life.
+  hackView(v) {
+    v.hacked = true;
+    v.mats.length = 0;
+    v.obj.traverse((o) => {
+      if (!o.isMesh) return;
+      const m = recolorMaterial(o.material, HERO_RULES.hackColor, 0.55);
+      m.userData.baseEmissive = o.material.userData.baseEmissive ?? o.material.emissiveIntensity;
+      m.userData.baseEmissiveColor = o.material.emissive.clone();
+      m.userData.baseColor = o.material.userData.baseColor ?? o.material.color.clone();
+      m.transparent = false; m.opacity = 1; m.depthWrite = true;
+      o.material = m;
+      v.mats.push(m);
+    });
+    v.cloaked = false;
+    v.chill = 0;
+  }
+
   // Middle of the model: the root already sits at the enemy's hover / flight height.
   enemyCenter(v, out) {
     return out.copy(v.root.position).add(tmpV2.set(0, v.height * 0.5, 0));
@@ -1373,6 +1435,7 @@ export class Renderer3D {
       seen.add(e.id);
       let v = this.enemyViews.get(e.id);
       if (!v) { v = this.makeEnemyView(e); this.enemyViews.set(e.id, v); }
+      if (e.converted && !v.hacked) this.hackView(v);
       v.age += dt;
       const sp = Math.min(1, v.age * 3);
       v.root.scale.setScalar(sp < 1 ? 0.3 + sp * 0.7 : 1);
@@ -1431,6 +1494,14 @@ export class Renderer3D {
           size: 0.04, endSize: 0.02, life: 0.5, stretch: 0.7, grav: 0.8, drag: 1.2,
         });
         if (Math.random() < 0.15) this.smokePuff(tmpV.x, tmpV.y + 0.1, tmpV.z, 1, { size: 0.15, grow: 2.5, spread: 0.1, rise: 0.7, life: 0.9, alpha: 0.3, warm: 0.4 });
+      }
+      // A ward gained mid-fight (a boss adapting) gets its bubble the first time it shows up.
+      if (!v.shield && e.maxShield > 0) {
+        v.shieldSize = Math.max(0.45, v.height * 0.62);
+        v.shield = new THREE.Mesh(this.sphereGeo, this.shieldMatBase.clone());
+        v.shield.scale.setScalar(v.shieldSize);
+        v.shield.position.y = v.height * 0.5;
+        v.root.add(v.shield);
       }
       if (v.shield) {
         const k = e.maxShield ? e.shield / e.maxShield : 0;
@@ -1513,7 +1584,8 @@ export class Renderer3D {
         m = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, color: col(p.color).clone().multiplyScalar(5), blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
         m.scale.setScalar(0.38);
         const tv = this.towerViews.get(p.tower?.id);
-        m.userData.start = tv ? this.muzzleWorld(tv, new THREE.Vector3()) : new THREE.Vector3(wx(p.x0), 0.8, wz(p.y0));
+        m.userData.start = tv ? this.muzzleWorld(tv, new THREE.Vector3()) : new THREE.Vector3(wx(p.x0), p.kind === 'missile' ? 0.95 : 0.8, wz(p.y0));
+        if (p.kind === 'missile') m.scale.setScalar(0.22);
         this.dynGroup.add(m);
         this.shellViews.set(p.id, m);
       }
@@ -1561,6 +1633,211 @@ export class Renderer3D {
   }
 
   // -------------------------------------------------------------------------------- effects
+  // -------------------------------------------------------------------------------- hero
+  // Position and size of a tower's view, or the hero's (for effects shared by both: upgrades, rank-ups, jams).
+  unitView(t) {
+    if (t?.isHero) return this.heroView ? { root: this.heroView.root, size: 1, topY: 0.95 } : null;
+    return this.towerViews.get(t?.id);
+  }
+
+  makeHeroView(h) {
+    const tpl = this.assets.get('hero_warbot');
+    const actions = {};
+    let obj, mixer = null;
+    if (tpl) {
+      obj = SkeletonUtils.clone(tpl.scene);
+      mixer = new THREE.AnimationMixer(obj);
+      for (const clip of tpl.animations) {
+        const a = mixer.clipAction(clip);
+        if (HERO_ONCE.has(clip.name)) { a.setLoop(THREE.LoopOnce, 1); a.clampWhenFinished = true; }
+        actions[clip.name] = a;
+      }
+    } else {
+      obj = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), new THREE.MeshStandardMaterial({ color: HERO.color }));
+      obj.position.y = 0.3;
+    }
+    obj.scale.setScalar(HERO_SCALE);
+    const mats = [];
+    obj.traverse((o) => {
+      if (!o.isMesh) return;
+      o.castShadow = true;
+      o.material = o.material.clone();
+      o.material.userData.baseEmissive = o.material.emissiveIntensity;
+      mats.push(o.material);
+    });
+    const inner = new THREE.Group();
+    inner.add(obj);
+    const root = new THREE.Group();
+    root.add(inner);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.47, 0.51, 48).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: col(HERO.color).clone().multiplyScalar(2), transparent: true, opacity: 0.8, toneMapped: false, depthWrite: false }));
+    ring.position.y = 0.02;
+    root.add(ring);
+    const bone = (n) => obj.getObjectByName(n) || null;
+    this.dynGroup.add(root);
+    return {
+      root, inner, obj, mixer, actions, mats, ring, state: null, current: null, yaw: yawOf(h.heading), yawRate: 0, twist: 0,
+      spine: bone('Spine'), barrels: [bone('Barrel_L'), bone('Barrel_R')], recoil: [0, 0], lastHp: h.hp, loss: 0, hitT: 0, hurt: 0,
+    };
+  }
+
+  // Cross-fade the hero to clip `want` (a one-shot clip restarts when asked again).
+  heroAnim(v, want, fade = 0.2) {
+    if (v.state === want || !v.actions[want]) return;
+    const next = v.actions[want];
+    next.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).play();
+    if (v.current && v.current !== next) v.current.crossFadeTo(next, fade, false);
+    v.current = next;
+    v.state = want;
+  }
+
+  // Muzzle of cannon `side` (0 = left) in world space.
+  heroMuzzle(v, side, out) {
+    const b = v.barrels[side];
+    if (!b) return out.copy(v.root.position).add(tmpV2.set(0, 0.9, 0));
+    return b.localToWorld(out.set(0, 0.14, 0));
+  }
+
+  syncHero(game, dt, ui) {
+    const h = game.hero;
+    if (!h) {
+      if (this.heroView) { this.dynGroup.remove(this.heroView.root); this.heroView = null; }
+      return;
+    }
+    const v = this.heroView || (this.heroView = this.makeHeroView(h));
+    v.root.position.set(wx(h.x), 0, wz(h.y));
+    const prev = v.yaw;
+    v.yaw = lerpAngle(v.yaw, yawOf(h.heading), Math.min(1, dt * 12));
+    v.yawRate += ((dt > 0 ? wrapAngle(v.yaw - prev) / dt : 0) - v.yawRate) * Math.min(1, dt * 8);
+    v.inner.rotation.y = v.yaw;
+    // A hard knock (a big chunk of hull gone at once) staggers it when it's standing still.
+    v.loss = Math.max(0, v.loss - dt * h.maxHp * 0.1) + Math.max(0, v.lastHp - h.hp);
+    v.lastHp = h.hp;
+    v.hitT = Math.max(0, v.hitT - dt);
+    if (v.loss > h.maxHp * 0.05 && h.online && !h.moving) { v.loss = 0; v.hitT = 0.55; v.state = null; }
+    let want;
+    if (h.downT > 0) want = 'death';
+    else if (h.rebootT > 0) want = 'activate';
+    else if (v.hitT > 0) want = 'hit';
+    else if (h.moving) want = 'run';
+    else if (Math.abs(v.yawRate) > 0.9) want = v.yawRate > 0 ? 'turn_left' : 'turn_right';
+    else if (h.engaged) want = 'fire';
+    else want = 'idle';
+    this.heroAnim(v, want, want === 'death' || want === 'hit' ? 0.1 : 0.2);
+    if (v.mixer) {
+      // The run cycle matches its stride to the ground speed; offline, the collapse plays out and holds.
+      if (v.current) v.current.timeScale = want === 'run' ? h.stats.speed / HERO_RUN_SPEED : want.startsWith('turn') ? 1.3 : 1;
+      v.mixer.update(dt);
+    }
+    // The torso twists the cannons onto the target (the legs keep walking), and each shot kicks its barrel back.
+    const aim = h.engaged && h.online ? THREE.MathUtils.clamp(wrapAngle(yawOf(h.angle) - v.yaw), -1.1, 1.1) : 0;
+    v.twist += (aim - v.twist) * Math.min(1, dt * 8);
+    if (v.spine && Math.abs(v.twist) > 1e-3) v.spine.rotateY(v.twist);
+    for (let i = 0; i < 2; i++) {
+      v.recoil[i] = Math.max(0, v.recoil[i] - dt * 7);
+      if (v.barrels[i] && v.recoil[i] > 0 && v.state !== 'fire') v.barrels[i].position.y -= 0.05 * v.recoil[i];
+    }
+    // Hull damage flashes the neon; offline it gutters and sparks.
+    v.hurt = Math.max(h.hurtT > 0 ? 1 : 0, v.hurt - dt * 5);
+    const down = h.downT > 0;
+    for (const m of v.mats) m.emissiveIntensity = (m.userData.baseEmissive || 0) * (down ? (Math.random() < 0.15 ? 0.6 : 0.05) : 1 + v.hurt * 2);
+    const jammed = h.jamT > 0;
+    if ((down || jammed) && Math.random() < dt * 14 && !this.fxBusy) {
+      const a = Math.random() * TAU;
+      this.sparkBurst(v.root.position.x + Math.cos(a) * 0.3, 0.3 + Math.random() * 0.5, v.root.position.z + Math.sin(a) * 0.3, jammed ? '#ff2a6a' : '#ffb000', 2, 1.6, { life: 0.2, size: 0.025, grav: -4, up: 0.2 });
+    }
+    const sel = ui.selected === h;
+    const rc = down ? col('#ff3355') : jammed ? col('#ff2a6a') : col(HERO.color);
+    v.ring.material.color.copy(rc).multiplyScalar(down ? 1 + Math.sin(this.time * 6) : sel ? 3.5 + Math.sin(this.time * 5) * 0.8 : 1.8);
+  }
+
+  // Translucent hero model following the cursor while it's being deployed.
+  heroGhost() {
+    if (this.heroGhostObj) return this.heroGhostObj;
+    const tpl = this.assets.get('hero_warbot');
+    const g = new THREE.Group();
+    const mat = new THREE.MeshBasicMaterial({ color: col(HERO.color).clone().multiplyScalar(1.4), transparent: true, opacity: 0.3, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+    if (tpl) {
+      const m = SkeletonUtils.clone(tpl.scene);
+      m.traverse((o) => { if (o.isMesh) { o.material = mat; o.castShadow = false; } });
+      m.scale.setScalar(HERO_SCALE);
+      g.add(m);
+    }
+    g.userData.mat = mat;
+    this.scene.add(g);
+    this.heroGhostObj = g;
+    return g;
+  }
+
+  // Screen-space hit test on the hero (it's tall, so clicks near its body count).
+  pickHero(clientX, clientY, game) {
+    const h = game.hero, v = this.heroView;
+    if (!h || !v) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    const c = v.root.position;
+    const p = this.project(c.x, 0.45, c.z), top = this.project(c.x, 1.0, c.z);
+    if (p.behind) return null;
+    const rad = Math.max(22, Math.abs(p.sy - top.sy) * 1.1);
+    return Math.hypot(p.sx - (clientX - rect.left), p.sy - (clientY - rect.top)) < rad ? h : null;
+  }
+
+  // The route the selected hero is walking, and a ring where it's headed.
+  showRoute(h) {
+    const pts = [[h.x, h.y], ...h.route];
+    const key = pts.map(([x, y]) => `${Math.round(x)},${Math.round(y)}`).join('|');
+    if (key !== this.routeKey) {
+      this.routeKey = key;
+      const geo = new LineGeometry();
+      geo.setPositions(pts.flatMap(([x, y]) => [wx(x), SIGHT_Y + 0.02, wz(y)]));
+      this.routeLine.geometry.dispose();
+      this.routeLine.geometry = geo;
+      this.routeLine.computeLineDistances();
+    }
+    this.routeMat.dashOffset -= 0.02;
+    this.routeLine.visible = pts.length > 1;
+    const d = h.dest;
+    this.destRing.visible = !!d;
+    if (d) {
+      this.destRing.position.set(wx(d.x), 0.14, wz(d.y));
+      this.destRing.scale.setScalar(0.35 + Math.sin(this.time * 6) * 0.04);
+      this.destRing.children[0].material.color.copy(col(HERO.color)).multiplyScalar(2.5);
+      this.destRing.children[1].material.color.copy(col(HERO.color)).multiplyScalar(0.8);
+    }
+  }
+
+  // Traps: thrown from the hero in an arc, then armed with a blinking light (yellow mine, cyan EMP).
+  syncTraps(game, dt) {
+    const seen = new Set();
+    for (const tr of game.traps) {
+      seen.add(tr.id);
+      let m = this.trapViews.get(tr.id);
+      if (!m) {
+        m = new THREE.Group();
+        m.add(new THREE.Mesh(this.trapGeo, this.trapMat));
+        const ring = new THREE.Mesh(this.trapRingGeo, this.trapRingMats[tr.emp ? 'emp' : 'mine']);
+        ring.position.y = 0.035;
+        m.add(ring);
+        const light = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, color: col(tr.emp ? '#00f0ff' : HERO_RULES.trapColor).clone().multiplyScalar(3), blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+        light.scale.setScalar(0.3);
+        light.position.y = 0.08;
+        m.add(light);
+        m.userData.light = light;
+        const hv = this.heroView;
+        m.userData.from = hv ? hv.root.position.clone().add(new THREE.Vector3(0, 0.7, 0)) : new THREE.Vector3(wx(tr.x), 0.7, wz(tr.y));
+        this.dynGroup.add(m);
+        this.trapViews.set(tr.id, m);
+      }
+      const k = Math.min(1, tr.age / 0.5), s = m.userData.from, tx = wx(tr.x), tz = wz(tr.y);
+      m.position.set(s.x + (tx - s.x) * k, s.y + (0.03 - s.y) * k + Math.sin(k * Math.PI) * 0.5, s.z + (tz - s.z) * k);
+      if (k < 1) m.rotation.y += dt * 12;
+      const armed = tr.armT <= 0;
+      m.userData.light.material.opacity = armed ? (Math.sin(this.time * 6 + tr.id) > 0.5 ? 1 : 0.25) : 0.1;
+    }
+    for (const [id, m] of this.trapViews) {
+      if (!seen.has(id)) { this.dynGroup.remove(m); this.trapViews.delete(id); }
+    }
+  }
+
   addFx(obj, life, update, end) {
     this.dynGroup.add(obj);
     this.fxItems.push({ obj, life, max: life, update, end });
@@ -2012,7 +2289,7 @@ export class Renderer3D {
           break;
         }
         case 'upgrade': {
-          const tv = this.towerViews.get(ev.tower.id);
+          const tv = this.unitView(ev.tower);
           if (!tv) break;
           const color = ev.tower.def.paths[ev.path].color;
           const p = tv.root.position;
@@ -2139,7 +2416,7 @@ export class Renderer3D {
           break;
         }
         case 'rankup': {
-          const tv = this.towerViews.get(ev.tower.id);
+          const tv = this.unitView(ev.tower);
           if (!tv) break;
           const p = tv.root.position;
           this.sparkBurst(p.x, tv.topY, p.z, '#ffe600', 10 + ev.rank * 3, 2.5, { up: 1, life: 0.8, size: 0.035, grav: -2 });
@@ -2147,7 +2424,7 @@ export class Renderer3D {
           break;
         }
         case 'jam': {
-          const tv = this.towerViews.get(ev.tower.id);
+          const tv = this.unitView(ev.tower);
           if (!tv) break;
           const p = tv.root.position, c = ev.kind === 'hijack' ? '#ffe600' : '#ff2a6a';
           this.sparkBurst(p.x, tv.topY, p.z, c, 12, 3, { life: 0.35, size: 0.03, grav: -3 });
@@ -2209,6 +2486,110 @@ export class Renderer3D {
           this.sparkBurst(x, 0.4, z, '#7df9ff', 40, r * 4, { life: 0.6, size: 0.04, up: 0.3, grav: -4 });
           break;
         }
+        case 'adapt': {
+          // A boss adapting at a skull: sparks in each new buff's color spiral off it, and a ring in the first one's.
+          const v = this.enemyViews.get(ev.enemy.id);
+          if (!v) break;
+          const c = this.enemyCenter(v, new THREE.Vector3());
+          ev.mods.forEach((m, i) => this.sparkBurst(c.x, c.y, c.z, MODS[m].color, 16, 3 + i * 0.6, { life: 0.9, size: 0.05, up: 0.6, grav: -2, heat: 0.3 }));
+          this.shockwave(c.x, c.z, 0.3, ev.enemy.radius / TILE * 5, MODS[ev.mods[0]].color, 0.7, 0.8);
+          break;
+        }
+        case 'variant': {
+          // Re-locking to a new variant: a shower of sparks off the turret as it swings.
+          const tv = this.towerViews.get(ev.tower.id);
+          if (tv) this.sparkBurst(tv.root.position.x, tv.topY * 0.8, tv.root.position.z, ev.tower.def.color, 14, 2.2, { life: 0.4, size: 0.03, up: 0.6, grav: -6 });
+          break;
+        }
+        // ---- hero
+        case 'herofire': {
+          const v = this.heroView;
+          if (!v) break;
+          const from = this.heroMuzzle(v, ev.side, new THREE.Vector3());
+          const ev2 = this.enemyViews.get(ev.target.id);
+          const to = ev2 ? this.enemyCenter(ev2, new THREE.Vector3()) : new THREE.Vector3(wx(ev.target.x), 0.4, wz(ev.target.y));
+          const arsenal = ev.hero.tiers[1];
+          const color = arsenal >= 5 ? '#ff2bd6' : arsenal >= 3 ? '#ff3355' : HERO.color;
+          this.beam(from, to, color, 0.04 + arsenal * 0.012, 0.07, { core: 0.9 });
+          this.flare(from.x, from.y, from.z, color, 0.45 + arsenal * 0.05, 0.06, 3);
+          this.sparkBurst(to.x, to.y, to.z, color, 4, 3, { life: 0.25, size: 0.03 });
+          // Standing and firing, the fire clip's own recoil plays in step with the shots; on the move, the barrels kick.
+          if (v.state === 'fire' && v.current) v.current.time = ev.side ? v.current.getClip().duration / 2 : 0;
+          else v.recoil[ev.side] = 1;
+          break;
+        }
+        case 'herohack': {
+          const v = this.heroView, ev2 = this.enemyViews.get(ev.enemy.id);
+          if (!v || !ev2) break;
+          const a = v.root.position.clone().add(tmpV2.set(0, 0.75, 0));
+          const b = this.enemyCenter(ev2, new THREE.Vector3());
+          const color = HERO_RULES.hackColor;
+          this.lightning([a, b], color, 0.4, { width: ev.convert ? 3.5 : 2.5 });
+          this.flare(b.x, b.y, b.z, color, 1.1, 0.25, 3);
+          this.shockwave(b.x, b.z, 0.1, 0.8, color, 0.5, 0.9);
+          if (ev.convert) this.flipbook(b, 'burst', 1.1, 0.4, color, 3, true);
+          break;
+        }
+        case 'convertzap': {
+          const a = this.enemyViews.get(ev.from.id), b = this.enemyViews.get(ev.to.id);
+          if (!a || !b) break;
+          const p = this.enemyCenter(a, new THREE.Vector3()), q = this.enemyCenter(b, new THREE.Vector3());
+          this.beam(p, q, HERO_RULES.hackColor, 0.05, 0.12, { core: 0.8 });
+          this.sparkBurst(q.x, q.y, q.z, HERO_RULES.hackColor, 5, 3, { life: 0.3, size: 0.03 });
+          break;
+        }
+        case 'convertend': {
+          const v = this.enemyViews.get(ev.enemy.id);
+          const c = v ? this.enemyCenter(v, new THREE.Vector3()) : new THREE.Vector3(wx(ev.enemy.x), 0.4, wz(ev.enemy.y));
+          this.flare(c.x, c.y, c.z, HERO_RULES.hackColor, 1.6, 0.3, 3);
+          this.shockwave(c.x, c.z, 0.2, 1.2, HERO_RULES.hackColor, 0.5, 0.9);
+          break;
+        }
+        case 'trapboom': {
+          const x = wx(ev.trap.x), z = wz(ev.trap.y), r = ev.r / TILE;
+          const color = ev.trap.emp ? '#00f0ff' : HERO_RULES.trapColor;
+          this.shockwave(x, z, 0.1, r, color, 0.45, 1);
+          this.flashLight(x, 0.5, z, color, 10, 3, 0.2);
+          if (ev.trap.emp) this.flipbook(new THREE.Vector3(x, 0.4, z), 'burst', r * 2.2, 0.45, color, 3.5, true);
+          break;
+        }
+        case 'enemyshot': {
+          // Return fire at the hero: a short red tracer and a spark on its hull.
+          const v = this.enemyViews.get(ev.enemy.id), hv = this.heroView;
+          if (!v || !hv || (this.fxBusy && Math.random() < 0.7)) break;
+          const from = this.enemyCenter(v, new THREE.Vector3());
+          const to = hv.root.position.clone().add(tmpV2.set((Math.random() - 0.5) * 0.3, 0.5, (Math.random() - 0.5) * 0.3));
+          const big = ev.enemy.def.boss;
+          this.beam(from, to, big ? ev.enemy.def.color : '#ff5a3c', big ? 0.1 : 0.045, big ? 0.18 : 0.1, { core: 0.8 });
+          this.sparkBurst(to.x, to.y, to.z, '#ffb070', big ? 10 : 3, 2.5, { life: 0.25, size: 0.03 });
+          break;
+        }
+        case 'herosalvo': {
+          const v = this.heroView;
+          if (!v) break;
+          const p = v.root.position;
+          this.flare(p.x, 0.95, p.z, HERO_RULES.missileColor, 0.9, 0.15, 3);
+          this.smokePuff(p.x, 0.9, p.z, 3, { size: 0.2, grow: 3, spread: 0.2, rise: 0.4, life: 1, alpha: 0.35, warm: 0.5 });
+          break;
+        }
+        case 'herodeploy': case 'heroreboot': {
+          const x = wx(ev.hero.x), z = wz(ev.hero.y);
+          const column = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 5, 24, 1, true), new THREE.MeshBasicMaterial({ color: col(HERO.color).clone().multiplyScalar(2.5), map: fadeUpTexture, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide }));
+          column.position.set(x, 2.5, z);
+          this.addFx(column, 0.9, (k) => { column.material.opacity = k * 0.6; column.scale.set(1 + (1 - k) * 0.4, 1, 1 + (1 - k) * 0.4); });
+          this.shockwave(x, z, 0.2, 1.3, HERO.color, 0.7, 1, 0.12);
+          this.sparkBurst(x, 0.3, z, HERO.color, 24, 3.5, { up: 0.9, life: 0.8, size: 0.04, grav: -3 });
+          this.flashLight(x, 1, z, HERO.color, 14, 4, 0.5);
+          break;
+        }
+        case 'herodown': {
+          const x = wx(ev.hero.x), z = wz(ev.hero.y);
+          this.sparkBurst(x, 0.5, z, '#ffb000', 30, 4.5, { life: 0.8, size: 0.045, up: 0.7 });
+          this.smokePuff(x, 0.4, z, 8, { size: 0.45, grow: 2.4, spread: 0.4, rise: 0.8, life: 2.4, alpha: 0.5, warm: 0.6 });
+          this.flashLight(x, 0.8, z, '#ff8a00', 18, 5, 0.4);
+          this.shakeT = Math.max(this.shakeT, 0.4);
+          break;
+        }
         case 'orbital': this.orbitalCharge(wx(ev.x), wz(ev.y), ev.r / TILE, ev.delay); break;
         case 'orbitalhit': this.orbitalImpact(wx(ev.x), wz(ev.y), ev.r / TILE); break;
       }
@@ -2268,6 +2649,8 @@ export class Renderer3D {
     this.updateSkyLanes(game, realDt);
     this.syncTowers(game, simDt, ui);
     this.syncEnemies(game, simDt);
+    this.syncHero(game, simDt, ui);
+    this.syncTraps(game, simDt);
     this.syncShells(game);
     this.syncPackets(game, simDt);
     this.updateFx(simDt);
@@ -2413,13 +2796,15 @@ export class Renderer3D {
   setSightBlockers(blocked) {
     const inset = 0.1;
     this.sightRects = blocked.map(([x, y, s]) => [x - HW + inset, y - HH + inset, x + s - HW - inset, y + s - HH - inset]);
+    // What an anti-air tower's view up to the flyers is blocked by: only the tall blocks.
+    this.airSightRects = this.sightRects.filter((_, i) => blocked[i][2] > 1);
     this.sightKey = '';
   }
 
   // Visibility polygon around (x, z): rays every degree plus a pair grazing each building corner (crisp shadow
   // edges), each cut short by the first building it meets. Returns [x, z] points in angle order.
-  sightPolygon(x, z, r, walls) {
-    const rects = walls ? this.sightRects.filter(([ax, az, bx, bz]) => {
+  sightPolygon(x, z, r, walls, air = false) {
+    const rects = walls ? (air ? this.airSightRects : this.sightRects).filter(([ax, az, bx, bz]) => {
       const dx = Math.max(ax - x, 0, x - bx), dz = Math.max(az - z, 0, z - bz);
       return dx * dx + dz * dz < r * r;
     }) : [];
@@ -2441,11 +2826,12 @@ export class Renderer3D {
   }
 
   // Show the sight polygon for a tower at (x, z) with range r (world units); rebuilt only when something changed.
-  showSight(x, z, r, color, walls, bright = 1) {
-    const key = `${x.toFixed(2)}|${z.toFixed(2)}|${r.toFixed(2)}|${walls}`;
+  // `air`: an anti-air-only tower, whose view up to the flyers only the tall blocks cut.
+  showSight(x, z, r, color, walls, bright = 1, air = false) {
+    const key = `${x.toFixed(2)}|${z.toFixed(2)}|${r.toFixed(2)}|${walls}|${air}`;
     if (key !== this.sightKey) {
       this.sightKey = key;
-      const poly = this.sightPolygon(x, z, r, walls);
+      const poly = this.sightPolygon(x, z, r, walls, air);
       const n = poly.length;
       const pos = new Float32Array(n * 9);
       for (let i = 0; i < n; i++) {
@@ -2470,10 +2856,10 @@ export class Renderer3D {
   }
 
   // Heat map for placing `type`: recolored only when the tower layout (or, for uplinks, tower levels) changes.
-  updateHeat(game, type) {
-    const key = `${type}|${game.towers.map((t) => (type === 'uplink' ? `${t.id}:${t.level}` : t.id)).join(',')}`;
+  updateHeat(game, type, variant = null) {
+    const key = `${type}|${variant}|${game.towers.map((t) => (type === 'uplink' ? `${t.id}:${t.level}` : t.id)).join(',')}`;
     if (key !== this.heat.key) {
-      const data = coverageMap(game, type);
+      const data = coverageMap(game, type, variant);
       let max = 0;
       for (const v of data) if (v > max) max = v;
       this.heat = { key, data, max: max || 1, type };
@@ -2519,11 +2905,25 @@ export class Renderer3D {
     this.reticle.visible = false;
     this.heatMesh.visible = false;
     this.airCover.visible = this.aimRing.visible = this.aimLine.visible = this.aimFar.visible = false;
-    if (ui.placing && this.settings.heatmap) this.updateHeat(game, ui.placing);
+    this.routeLine.visible = this.destRing.visible = false;
+    if (this.heroGhostObj) this.heroGhostObj.visible = false;
+    if (ui.placing && this.settings.heatmap) this.updateHeat(game, ui.placing, ui.placeVariant?.[ui.placing]);
     if (this.ghosts) for (const g of Object.values(this.ghosts)) g.visible = false;
     const sel = ui.selected;
-    if (sel) this.showSight(wx(sel.x), wz(sel.y), sel.range / TILE, sel.def.color, !sel.ignoresWalls);
-    if (sel && (sel.def.air || sel.stats.air)) this.showAirCover(game, sel.x, sel.y, sel.range, !sel.ignoresWalls, sel.def.color);
+    if (sel?.isHero) this.showRoute(sel);
+    if (ui.placingHero && h && h.tx >= 0) {
+      // Deploying the hero: its ghost and the ground it would cover, green where it can stand.
+      const ok = game.canDeployHero(h.x, h.y) && game.credits >= HERO.cost;
+      const gh = this.heroGhost();
+      gh.visible = true;
+      gh.position.set(wx(h.x), 0, wz(h.y));
+      gh.userData.mat.color.copy(col(ok ? HERO.color : '#ff3355')).multiplyScalar(1.4);
+      gh.userData.mat.opacity = 0.24 + Math.sin(this.time * 8) * 0.08;
+      this.showSight(wx(h.x), wz(h.y), HERO.base.range, ok ? HERO.color : '#ff3355', true, ok ? 1 : 0.3);
+      return;
+    }
+    if (sel) this.showSight(wx(sel.x), wz(sel.y), sel.range / TILE, sel.def.color, !sel.ignoresWalls, 1, sel.hitsAir && !sel.hitsGround);
+    if (sel && sel.hitsAir) this.showAirCover(game, sel.x, sel.y, sel.range, !sel.ignoresWalls, sel.def.color);
     // Manual aim: the inspected tower's spot / line, or a live preview under the cursor while one is being picked.
     const aimer = ui.aiming || (sel?.aiming ? sel : null);
     if (aimer) {
@@ -2548,6 +2948,9 @@ export class Renderer3D {
     if (ui.placing) {
       const def = TOWERS[ui.placing];
       const size = def.size || 1;
+      const pv = variantOf(def, ui.placeVariant?.[ui.placing]);
+      const placeStats = computeStats(def, [0, 0, 0], 0, pv);
+      const placeHits = targetsOf(def, placeStats, pv);
       const a = footprintAnchor(size, h.x, h.y);
       const fx = a.tx - HW + size / 2, fz = a.ty - HH + size / 2;
       const fits = game.canPlace(a.tx, a.ty, size);
@@ -2556,10 +2959,12 @@ export class Renderer3D {
       this.tileMarker.position.set(fx, 0.115, fz);
       this.tileMarker.scale.setScalar(size);
       this.tileMarker.material.color.set(ok ? '#39ff14' : '#ff3355').multiplyScalar(2);
-      if (!sel) this.showSight(fx, fz, def.base.range, def.color, ui.placing !== 'plasma' && ui.placing !== 'uplink', ok ? 1 : 0.3);
-      if (!sel && def.air && fits) this.showAirCover(game, (a.tx + size / 2) * TILE, (a.ty + size / 2) * TILE, def.base.range * TILE, ui.placing !== 'plasma', def.color);
+      const airOnly = placeHits.air && !placeHits.ground;
+      if (!sel) this.showSight(fx, fz, placeStats.range, def.color, ui.placing !== 'plasma' && ui.placing !== 'uplink', ok ? 1 : 0.3, airOnly);
+      if (!sel && placeHits.air && fits) this.showAirCover(game, (a.tx + size / 2) * TILE, (a.ty + size / 2) * TILE, placeStats.range * TILE, ui.placing !== 'plasma', def.color);
       const gh = this.ghost(ui.placing);
       gh.visible = fits;
+      if (gh.userData.head) gh.userData.head.rotation.x = placeHits.air && !placeHits.ground ? -AA_PITCH : 0;
       gh.position.set(fx, PAD_Y, fz);
       gh.userData.mat.opacity = 0.22 + Math.sin(this.time * 8) * 0.08;
     } else if (game.grid[h.ty][h.tx] !== 1) {
@@ -2641,6 +3046,69 @@ export class Renderer3D {
       g.fillText(text, p.sx, p.sy + 2);
       g.globalAlpha = 1;
     }
+    // The hero: hull bar (always), a status tag while it's offline, rebooting or jammed, and its name when selected.
+    const hero = game.hero, hv = this.heroView;
+    if (hero && hv) {
+      const p = this.project(hv.root.position.x, 1.25, hv.root.position.z);
+      if (!p.behind) {
+        const w = 46, x = p.sx - w / 2, y = p.sy;
+        const k = Math.max(0, hero.hp / hero.maxHp);
+        g.fillStyle = 'rgba(0,0,0,0.75)';
+        g.fillRect(x - 1, y - 1, w + 2, 6);
+        g.fillStyle = hero.downT > 0 ? '#ff3355' : k > 0.5 ? HERO.color : k > 0.25 ? '#ffe600' : '#ff3355';
+        g.fillRect(x, y, w * (hero.downT > 0 ? 1 - hero.downT / HERO_RULES.downTime : k), 4);
+        if (hero.contact > 0 && hero.online) { g.fillStyle = `rgba(255,51,85,${0.5 + 0.5 * Math.sin(this.time * 18)})`; g.fillRect(x + w * k - 2, y - 1, 3, 6); }
+        const tag = hero.downT > 0 ? `OFFLINE ${hero.downT.toFixed(1)}` : hero.rebootT > 0 ? 'REBOOTING' : hero.jamT > 0 ? (hero.jamKind === 'emp' ? 'EMP' : 'JAMMED') : ui.selected === hero ? HERO.name : '';
+        if (tag) {
+          g.font = '700 10px "Share Tech Mono", monospace';
+          g.textAlign = 'center';
+          const tw = g.measureText(tag).width + 8;
+          g.fillStyle = 'rgba(10,4,14,0.8)';
+          g.fillRect(p.sx - tw / 2, y - 16, tw, 13);
+          g.fillStyle = hero.downT > 0 || hero.jamT > 0 ? '#ff4f86' : HERO.color;
+          g.fillText(tag, p.sx, y - 6);
+        }
+        if (ui.selected === hero && hero.rank > 0) {
+          g.strokeStyle = '#ffe600';
+          g.lineWidth = 2;
+          for (let i = 0; i < hero.rank; i++) {
+            const cy = y - 22 - i * 5;
+            g.beginPath(); g.moveTo(p.sx - 7, cy + 4); g.lineTo(p.sx, cy); g.lineTo(p.sx + 7, cy + 4); g.stroke();
+          }
+        }
+      }
+    }
+    // Hijacked enemies: a green diamond and how long they have left before they blow.
+    for (const e of game.enemies) {
+      if (!e.converted) continue;
+      const v = this.enemyViews.get(e.id);
+      if (!v) continue;
+      const p = this.project(v.root.position.x, v.root.position.y + v.height + 0.25, v.root.position.z);
+      if (p.behind) continue;
+      const s = 5;
+      g.strokeStyle = HERO_RULES.hackColor;
+      g.lineWidth = 1.5;
+      g.beginPath(); g.moveTo(p.sx, p.sy - s - 6); g.lineTo(p.sx + s, p.sy - 6); g.lineTo(p.sx, p.sy + s - 6); g.lineTo(p.sx - s, p.sy - 6); g.closePath(); g.stroke();
+      g.fillStyle = 'rgba(0,0,0,0.7)';
+      g.fillRect(p.sx - 13, p.sy + 2, 26, 3);
+      g.fillStyle = HERO_RULES.hackColor;
+      g.fillRect(p.sx - 12, p.sy + 2.5, 24 * (e.converted.t / e.converted.max), 2);
+    }
+    // Re-locking after a variant switch: a small tag with the time left.
+    for (const t of game.towers) {
+      if (!(t.relockT > 0) || t.jamT > 0) continue;
+      const tv = this.towerViews.get(t.id);
+      if (!tv) continue;
+      const p = this.project(tv.root.position.x, tv.topY + 0.35, tv.root.position.z);
+      if (p.behind) continue;
+      const text = `RE-LOCK ${t.relockT.toFixed(1)}`;
+      g.font = '700 10px "Share Tech Mono", monospace';
+      const tw = g.measureText(text).width + 8;
+      g.fillStyle = 'rgba(10,4,14,0.8)';
+      g.fillRect(p.sx - tw / 2, p.sy - 8, tw, 13);
+      g.fillStyle = t.def.color;
+      g.fillText(text, p.sx, p.sy + 2);
+    }
     // Veterancy chevrons over the inspected tower.
     const sel = ui.selected;
     if (sel && sel.rank > 0) {
@@ -2680,7 +3148,7 @@ export class Renderer3D {
     // Health bars.
     for (const e of game.enemies) {
       const v = this.enemyViews.get(e.id);
-      if (!v || !e.revealed) continue;
+      if (!v || !e.revealed || e.converted) continue;
       const damaged = e.hp < e.maxHp - 0.5 || (e.maxShield && e.shield < e.maxShield - 0.5);
       if (!damaged && !e.def.boss) continue;
       const top = v.root.position.y + (v.vis.hover ? 0 : 0) + v.height + 0.12;

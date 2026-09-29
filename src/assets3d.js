@@ -11,6 +11,8 @@ export const MODEL_FILES = [
   'enemy_runner', 'enemy_runner_walk', 'enemy_drone', 'enemy_brute', 'enemy_aegis', 'enemy_phantom',
   'enemy_splitter', 'enemy_mite', 'enemy_medic', 'boss_titan', 'boss_overmind',
   'env_core', 'env_portal', 'env_building',
+  // The hero war bot: Tripo multi-view mesh, rigged with its clips in tools/blender/rig_hero.py.
+  'hero_warbot',
   // Tier-5 evolutions: Meshy-7 flagship per tower + Blender path recolors for the other paths.
   'tower_laser_t5', 'tower_plasma_t5', 'tower_tesla_t5', 'tower_cryo_t5', 'tower_rail_t5', 'tower_uplink_t5',
   'tower_laser_p1_t5', 'tower_laser_p2_t5', 'tower_plasma_p1_t5', 'tower_plasma_p2_t5',

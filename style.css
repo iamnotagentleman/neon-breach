@@ -378,6 +378,8 @@ kbd {
 
 /* ---------- Modal ---------- */
 .modal { position: fixed; inset: 0; z-index: 10; background: rgba(2, 1, 8, 0.72); display: flex; align-items: center; justify-content: center; backdrop-filter: blur(3px); padding: 16px; }
+.bb-mods { margin-left: 8px; }
+.bb-mods b { display: inline-block; min-width: 13px; margin-right: 3px; padding: 0 2px; font-size: 9px; line-height: 12px; text-align: center; color: var(--vc); border: 1px solid var(--vc); background: rgba(8, 5, 18, 0.8); }
 .modal.hidden { display: none; }
 .modal-box {
   width: min(620px, 100%);
@@ -546,3 +548,13 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   .glitch::before, .glitch::after, .hint, .btn-wave.pulse { animation: none; }
 }
+
+/* Hero war bot: its shop entry spans the row; the inspector shows its hull and status. */
+.shop-item.hero { grid-column: 1 / -1; }
+.shop-item.hero .nm .fp { color: var(--c); border-color: color-mix(in srgb, var(--c) 60%, transparent); }
+.shop-item.hero.down { border-color: var(--red); }
+.shop-item.hero.down .cost { color: var(--red); }
+.hi-status { font-size: 10px; letter-spacing: 0.08em; color: var(--dim); }
+.hero-paths { display: grid; gap: 4px; margin: 8px 0 4px; font-size: 10px; line-height: 1.4; color: var(--dim); }
+.hero-paths div { border-left: 2px solid var(--pc); padding-left: 6px; }
+.hero-paths b { display: block; color: var(--pc); font-weight: normal; letter-spacing: 0.1em; }
